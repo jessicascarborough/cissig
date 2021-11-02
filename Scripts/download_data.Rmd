@@ -1,0 +1,159 @@
+---
+title: "Download Data"
+author: "Jessica Scarborough"
+date: "7/21/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_packages}
+
+library(RTCGAToolbox)
+library(here)
+library(tidyverse)
+
+```
+
+In this script, we will download all the data required for this project from GDSC and TCGA. This script will only download epithelial origin cancer samples from the TCGA. GDSC will be filtered for only epithelial cell lines in `clean_data.Rmd`.
+
+We'll start by creating some directories to store these data. 
+
+```{r make_dir}
+
+dir.create(here("Data"), showWarnings = FALSE)
+dir.create(here("Data", "GDSC"), showWarnings = FALSE)
+dir.create(here("Data", "TCGA"), showWarnings = FALSE)
+
+```
+
+# GDSC
+
+## Expression
+
+In order to download the expression data, we'll create a function, `get_exp`. This function downloads the data directly from a GDSC URL, creates a zipped file in the `Data/GDSC` sub-directory of our project directory, and unzips the file. We'll read the unzipped file and store these data as a tibble in a local variable, `gdsc_expr`. These data are very large, so we need to increase the timeout limit for this download. Additionally, this function will check for the presence of the raw data file, `Cell_line_RMA_proc_basalExp.txt`, before downloading the data. If the file exists, the function will simply return the data from this file as a tibble. 
+
+```{r load_exp, message = FALSE}
+options(timeout = 6000) # increased from default of 60 s
+
+get_exp <- function(cache) {
+  
+  # check if file has already been downloaded at the provided cache
+  if(!file.exists(here(cache, "/Cell_line_RMA_proc_basalExp.txt"))) {
+    download.file(
+      "https://www.cancerrxgene.org/gdsc1000/GDSC1000_WebResources//Data/preprocessed/Cell_line_RMA_proc_basalExp.txt.zip",
+      destfile = here(cache, "gdsc_expr_rma.zip"))
+    unzip(zipfile = here(cache, "gdsc_expr_rma.zip"), exdir = cache)
+    file.remove(here(cache, "gdsc_expr_rma.zip")) #remove the zombie zip file
+  } else {
+    message("using cached gdsc data")
+  }
+  
+  exp_df <- readr::read_tsv(paste0(cache, "/Cell_line_RMA_proc_basalExp.txt"))
+  return(exp_df)
+  
+}
+
+gdsc_expr <- get_exp(here("Data", "GDSC"))
+
+```
+
+As originally loaded, the expression data set (`gdsc_expr`) has `r nrow(gdsc_expr)` rows and `r ncol(gdsc_expr)` columns. 
+
+
+## Drug response
+
+For the drug response data, we'll create the `get_dr` function, using `curl_download` from the `curl` package to download the drug response data using file transfer protocol (FTP), storing the unaltered excel file in the `Data/GDSC` sub-directory of our project directory. We'll read this file using `read_excel` from the `readxl` package and store the data as a local variable, `gdsc_dr`. 
+
+```{r load_dr}
+options(timeout = 600) # increased from default of 60 s
+
+get_dr <- function(cache) {
+  
+  # check if file has already been downloaded at the provided cache
+  if(!file.exists(paste0(cache, "/gdsc_dr.xlsx"))) {
+    
+    # download file, store in `Data` dir
+    curl::curl_download(
+      "ftp://ftp.sanger.ac.uk/pub/project/cancerrxgene/releases/current_release/GDSC2_fitted_dose_response_25Feb20.xlsx",
+      destfile = paste0(cache, "/gdsc_dr.xlsx"))
+    
+  } else {
+    message("using cached gdsc data")
+  }
+  
+  #read into R
+  df <- readxl::read_excel(paste0(cache, "/gdsc_dr.xlsx"))
+  return(df)
+  
+}
+
+gdsc_dr <- get_dr(here("Data", "GDSC"))
+
+
+```
+
+As originally loaded, the drug response data set (`gdsc_dr`) has `r nrow(gdsc_dr)` rows and `r ncol(gdsc_dr)` columns.
+
+
+### Cell Line Meta Data
+
+Finally, we'll create the `get_meta` function to use `curl_download` from the `curl` package to download the cell line characterization (meta) data using file transfer protocol (FTP), storing the unaltered excel file in the `Data/GDSC` sub-directory of our project directory. We'll read this file using `read_excel` from the `readxl` package and store the data as a local variable, `data_raw_meta`. 
+
+```{r load_meta}
+
+get_meta <- function(cache) {
+  
+  if(!file.exists(paste0(cache, "/Cell_Lines_Details.xlsx"))) {
+    curl::curl_download("ftp://ftp.sanger.ac.uk/pub/project/cancerrxgene/releases/current_release/Cell_Lines_Details.xlsx",
+                        destfile = paste0(cache, "/Cell_Lines_Details.xlsx"))
+  } else {
+    message("using cached metadata")
+  }
+  df <- readxl::read_excel(paste0(cache, "/Cell_Lines_Details.xlsx"))
+  return(df)
+}
+
+data_raw_meta <- get_meta(here("Data", "GDSC"))
+
+```
+
+As originally loaded, the cell line meta data set (`data_raw_meta`) has `r nrow(data_raw_meta)` rows and `r ncol(data_raw_meta)` columns. 
+
+# TCGA
+
+Here, we'll download RSEM normalized RNA seqencing data for tumor samples from a multitude of disease sites. We'll use the `RTCGAToolbox` which downloads Firehose Level 3 and 4 data (pre-processed). 
+
+Let's take a look at the available datasets along with the latest running/analyzing dates. 
+
+```{r get_datasets_dates}
+
+getFirehoseDatasets()
+
+getFirehoseRunningDates(last = 3)
+
+```
+
+
+From there, we will use only disease sites with an epithelial origin and the latest running date. 
+
+```{r download_tcga, message=FALSE}
+
+tcga_labels <- c("ACC", "BLCA", "BRCA", "CESC", "CHOL", "COADREAD", "ESCA", "HNSC", "KIRC", "KIRP", "KICH", "LIHC", "LUAD", "LUSC", "MESO", "OV", "PAAD", "PRAD", "STAD", "THCA", "THYM", "UCEC")
+
+
+saveRDS(tcga_labels, file = here("Data", "TCGA", "tcga_labels.rds")) # Save for reading in in clean_data.Rmd script
+
+for (site in tcga_labels){
+  tcga_data <- getFirehoseData(dataset = site, runDate = "20160128", # download data
+                            forceDownload = FALSE, clinical = TRUE, 
+                            RNASeq2GeneNorm = TRUE) # don't force download if file already exists
+  tcga_expr <- getData(tcga_data, "RNASeq2GeneNorm")[[1]]@DataMatrix #extract RSEM normalized rnaseq v2 data
+  write.csv(tcga_expr, file = here("Data", "TCGA", paste0(site, "_rnaseq_rsem.csv")), 
+          quote = FALSE) # write file for each disease site
+}
+
+
+```

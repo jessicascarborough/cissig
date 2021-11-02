@@ -1,0 +1,237 @@
+---
+title: "Clean Data"
+author: "Jessica Scarborough"
+date: "7/21/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load_packages}
+
+library(janitor)
+library(knitr)
+library(here)
+library(tidyverse)
+
+```
+
+First, we'll need to set our drug of interest here as `drug`. This will be important for filtering cell lines in the GDSC and creating directories to store data and results. 
+
+```{r gdsc_drug_param}
+
+drug <- "Cisplatin"
+
+```
+
+First we'll create the appropriate drug-specific directories in our project.
+
+```{r mk_directories}
+
+dir.create(here("Data"), showWarnings = FALSE)
+dir.create(here("Data", drug), showWarnings = FALSE)
+dir.create(here("Results"), showWarnings = FALSE)
+dir.create(here("Results", drug), showWarnings = FALSE)
+dir.create(here("Results", drug, "Coexpression"), showWarnings = FALSE)
+dir.create(here("Results", drug, "DE"), showWarnings = FALSE)
+dir.create(here("Results", drug, "Prediction_Modeling"), showWarnings = FALSE)
+dir.create(here("Results", drug, "Plots"), showWarnings = FALSE)
+dir.create(here("Results", drug, "Plots", "Linear_Models"), showWarnings = FALSE)
+dir.create(here("Results", drug, "Plots", "ROC_Curves"), showWarnings = FALSE)
+dir.create(here("Results", drug, "Plots", "Null_Model_Metrics"), showWarnings = FALSE)
+
+```
+
+Here, we'll clean the data downloaded with the `download_data.Rmd` file. 
+
+# TCGA
+
+Read in all the TCGA subtypes to be included in our epithelial TCGA dataset. Each disease site's file is downloaded using `download_data.Rmd`. 
+
+## Clean TCGA RNA Seq V2
+
+```{r read_TCGA}
+
+tcga_labels <- readRDS(here("Data", "TCGA", "tcga_labels.rds"))
+
+tcga_datalist <- list()
+
+for (site in tcga_labels){
+  site_data <- read.csv(file = here("Data", "TCGA", paste0(site, "_rnaseq_rsem.csv")), row.names = 1)
+  dup_genes_tcga <- row.names(site_data)[duplicated(row.names(site_data))] # we use this instead of distinct because distinct keeps one of the duplicates
+  site_data <- site_data %>%
+    tibble::rownames_to_column(var = "gene_name") %>%
+    filter(!(gene_name %in% dup_genes_tcga)) %>% # in this case, we don't filter anything out because there are no dups
+    # dplyr::distinct(gene_name, .keep_all = TRUE) %>%
+    gather(sample_ID, value, -gene_name) %>%
+    spread(gene_name, value) %>%
+    mutate(tcga_label = site) %>%
+    select(sample_ID, tcga_label, everything())
+  tcga_datalist[[site]] <- site_data
+}
+
+tcga_data <- dplyr::bind_rows(tcga_datalist)
+colnames(tcga_data) <- str_replace_all(colnames(tcga_data), "-", "_")
+
+saveRDS(tcga_data, file = here("Data", "TCGA", "compiled_rnaseq_rsem.rds"))
+
+# tcga_data <- readRDS(here("Data", "TCGA", "compiled_rnaseq_rsem.rds"))
+
+
+```
+
+
+# Genomics of Drug Sensitivity in Cancer (GDSC)
+
+As above with the TCGA Data, the GDSC data must be downloaded using `download_data.Rmd`.
+
+## Clean metadata
+
+First, we'll load the meta data and print our options for cell line labels. From that, we'll list the labels we plan to keep and extract only the cell lines with those labels. 
+
+```{r clean_gdsc_meta}
+
+gdsc_meta <- readxl::read_excel(here("Data", "GDSC", "Cell_Lines_Details.xlsx")) %>%
+  clean_names()
+
+unique(gdsc_meta$gdsc_tissue_descriptor_2)
+
+labels_epi_gdsc <- c("head and neck", "oesophagus", "breast", "biliary_tract", 
+                     "large_intestine", "liver", "adrenal_gland",
+                     "stomach", "kidney", "lung_NSCLC_adenocarcinoma",
+                     "lung_NSCLC_squamous_cell_carcinoma","mesothelioma", 
+                     "pancreas", "skin_other", "thyroid", "Bladder", 
+                     "cervix", "endometrium", "ovary", "prostate", "testis", 
+                     "urogenital_system_other", "uterus")
+
+labels_non_epi_gdsc <- gdsc_meta %>%
+  filter(!(gdsc_tissue_descriptor_2 %in% labels_epi_gdsc))
+unique(labels_non_epi_gdsc$gdsc_tissue_descriptor_2) 
+labels_epi_gdsc #show what we are and aren't including
+
+
+gdsc_meta_epi <- gdsc_meta %>%
+  filter(gdsc_tissue_descriptor_2 %in% labels_epi_gdsc) %>%
+  mutate(cosmic_id = paste0("DATA.", cosmic_identifier)) %>%
+  dplyr::select(cosmic_id, tissue_label = gdsc_tissue_descriptor_2, tcga_label = cancer_type_matching_tcga_label)
+
+
+```
+
+
+## Clean expression microarray
+
+```{r clean_expr_gdsc}
+
+gdsc_expr <- readr::read_tsv(here("Data", "GDSC", "Cell_line_RMA_proc_basalExp.txt"))
+
+dup_genes_gdsc <- gdsc_expr$GENE_SYMBOLS[duplicated(gdsc_expr$GENE_SYMBOLS)]
+
+gdsc_expr <- gdsc_expr %>%
+  dplyr::select(-GENE_title) %>%
+  filter(!(GENE_SYMBOLS %in% dup_genes_gdsc)) %>% # remove duplicated genes
+  mutate(GENE_SYMBOLS = str_replace_all(GENE_SYMBOLS, "-", "_")) %>%
+  gather(cosmic_id, value, -GENE_SYMBOLS) %>%
+  spread(GENE_SYMBOLS, value) %>%
+  filter(cosmic_id %in% gdsc_meta_epi$cosmic_id)
+
+```
+
+
+## Clean drug response
+
+
+```{r clean_dr_gdsc}
+
+gdsc_dr <- readxl::read_excel(here("Data", "GDSC", "gdsc_dr.xlsx"))
+
+gdsc_dr <- gdsc_dr %>%
+  filter(DRUG_NAME==drug) %>%
+  mutate(IC50 = log2(exp(LN_IC50))) %>% # convert natural log to log2
+  dplyr::select(cosmic_id = COSMIC_ID, IC50, AUC) %>%
+  mutate(cosmic_id = paste0("DATA.", cosmic_id)) %>%
+  filter(cosmic_id %in% gdsc_meta_epi$cosmic_id)
+
+```
+
+
+## Tidied dataset
+
+```{r tidy_gdsc_data}
+
+tidy_gdsc <- gdsc_dr %>%
+  inner_join(gdsc_meta_epi) %>%
+  inner_join(gdsc_expr) %>%
+  select(-tcga_label)
+
+```
+
+## Remove gdsc cell lines that aren't in all three (meta, dr, expression) datasets
+
+```{r overlap_celllines}
+
+# tidied dataset will only include samples (cell lines) that are in all three datasets because we used inner join
+
+gdsc_dr <- gdsc_dr %>%
+  filter(cosmic_id %in% tidy_gdsc$cosmic_id) 
+
+gdsc_meta_epi <- gdsc_meta_epi %>%
+  filter(cosmic_id %in% tidy_gdsc$cosmic_id)
+
+gdsc_expr <- gdsc_expr %>%
+  filter(cosmic_id %in% tidy_gdsc$cosmic_id)
+
+```
+
+# Filter for only overlapping genes between TCGA and GDSC
+
+Our analysis will require that we only use genes that are found in both TCGA and GDSC. 
+
+```{r overlap_genes}
+
+gdsc_genes <- colnames(gdsc_expr)[2:ncol(gdsc_expr)]
+tcga_genes <- colnames(tcga_data)[3:ncol(tcga_data)]
+overlap_genes <- intersect(gdsc_genes, tcga_genes) # find genes included in both gdsc and tcga
+
+# filter genes in gdsc and tcga datasets
+gdsc_expr <- gdsc_expr %>%
+  select(cosmic_id, all_of(overlap_genes))
+
+tidy_gdsc <- tidy_gdsc %>%
+  select(cosmic_id, IC50, AUC, tissue_label, all_of(overlap_genes))
+
+tcga_data <- tcga_data %>%
+  select(sample_ID, tcga_label, all_of(overlap_genes))
+
+```
+
+# Save data
+
+```{r save_data}
+
+save(gdsc_expr, gdsc_dr, gdsc_meta_epi, tcga_data, tidy_gdsc,
+     file = here("Data", drug, "cleaned_gdsc_tcga.RData"))
+
+load(here("Data", drug, "cleaned_gdsc_tcga.RData"))
+
+```
+
+```{r plot_cisplatin}
+
+ggplot(tidy_gdsc, aes(x = IC50)) + 
+  geom_histogram(bins = 20) + 
+  labs(title = "Distribution of IC50 across 430 epithelial-based cell lines in GDSC", 
+       x = "log2(IC50) in uM") + 
+  geom_vline(xintercept = median(tidy_gdsc$IC50), color = "red") +
+  theme_bw() + 
+  annotate("text", x = 7, y = 52, label = paste("Mean =", 2^mean(tidy_gdsc$IC50))) +
+  annotate("text", x = 7, y = 49, label = paste("Median =", 2^median(tidy_gdsc$IC50))) +
+  annotate("text", x = 7, y = 46, label = paste("Min =", 2^min(tidy_gdsc$IC50))) +
+  annotate("text", x = 7, y = 43, label = paste("Max =", 2^max(tidy_gdsc$IC50))) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+

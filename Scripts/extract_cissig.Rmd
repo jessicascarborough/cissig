@@ -1,0 +1,622 @@
+---
+title: "Clean Data"
+author: "Jessica Scarborough"
+date: "7/22/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load_packages}
+
+library(knitr)
+library(here)
+library(samr)
+library(limma)
+library(multtest)
+library(foreach)
+library(doParallel)
+library(tidyverse)
+
+```
+
+In this document, we will work through ranking cell lines based on their drug response, performing differential gene expression between good and poor responders, and utilizing differentially expressed genes as seeds in a co-expression network of independent, disparate samples. Seed genes that show consistently strong co-expression will be extracted to become the gene expression signature. 
+
+We'll start by setting the drug of interest and our parameters for the signature extraction. 
+
+```{r params}
+
+drug <- "Cisplatin"
+de_comp_perc = 0.20
+rm_extreme_perc = 0.0
+sam_perm = 10000
+mult_perm = 1000
+n_folds = 5
+
+```
+
+Then, we will load the data that was downloaded (`download_data.Rmd`) and cleaned (`clean_data.Rmd`) previously.his includes four data frames: `gdsc_meta_epi`, `gdsc_dr` (IC50 drug response from the GDSC dataset, version 2), `gdsc_expr` (microarray expression data from the GDSC dataset), and `tcga_data` (RNA-seq expression data from TCGA). All of these data includes only cell lines or samples from epithelial-based cancers. Therefore, signatures we extract will be predictive for cancers of epithelial origin (i.e. carcinomas, adenocarcinomas). 
+
+
+```{r load_data}
+
+load(here("Data", drug, "cleaned_gdsc_tcga.RData"))
+
+```
+
+
+
+# Helper Functions
+
+## Differential expression input
+
+Here, we'll start with two functions that are required for setting up our differential expression analysis. First, `create_test_groups` performs data partitioning. Then, `input_DE` performs all data cleaning and formatting that's required before we perform the differential gene expression analysis. 
+
+```{r input_helpers}
+
+create_test_groups <- function(tidy_data, n_folds, seed = NA){
+  # This helper function takes our tidied data, and returns cell lines 
+  # separated into a given number of folds (`n_folds`)
+  if(is.na(seed)==FALSE){
+    set.seed(seed)
+  }
+  shuffled_lines <- tidy_data$cosmic_id[sample(nrow(tidy_data), replace = FALSE)]
+  folds <- cut(seq(1, length(shuffled_lines)), breaks = n_folds, labels = FALSE)
+  
+  testing_sets <- list()
+  for(i in 1:n_folds){
+    test_lines <- shuffled_lines[folds==i]
+    testing_sets[[i]] <- test_lines
+  }
+  return(testing_sets)
+}
+
+test_groups <- create_test_groups(tidy_gdsc, n_folds = 5, seed = 0)
+
+input_DE <- function(tidy_data, de_comp_perc, rm_extreme_perc){
+  # This is a crucial function for creating the input to the user-defined DE fns
+  # below. 
+  #
+  # It performs the following actions beginning with the tidied gdsc data: 
+  #     1. Removes the most extreme IC50 cell lines (based on `rm_extreme_perc`)
+  #     2. Classifies cell lines as resistant (1) or sensitive (2), based on`de_comp_perc`
+  #     3. Removes cell lines that aren't classified as 1 or 2
+  #     4. Transposes dataframe so that cell lines are columns and genes are rows
+  #         NOTE: this goes against everything in my data scientist bones, 
+  #         but it's how the DE functions expect the data to be formatted
+  #     5. Returns the expression matrix with a vector that lines up to classify 
+  #         each column as resistant or sensitive 
+  #
+  # A list is return containing the following: 
+  #   x: drug response data for the combined high and low cell lines
+  #   y: label, 1 (high IC50, resistant) or 2 (low IC50, sensitive) 
+  #   num.high: length of high IC50 cell lines
+  #   num.low: length of low IC50 cell lines # makes it easier for adding to methods later
+  #
+  # Steps 1-4:
+  filtered_data <- tidy_data %>%
+    dplyr::filter(IC50 < quantile(IC50, 1-rm_extreme_perc) & # remove extreme drug responses
+            IC50 > quantile(IC50, rm_extreme_perc)) %>%
+    mutate(IC50_low = case_when(IC50 >= quantile(IC50, 1-de_comp_perc) ~ "1", # not low, resistant
+                                 IC50 < quantile(IC50, 1-de_comp_perc) &
+                                   IC50 >= quantile(IC50, de_comp_perc) ~ "NA",
+                                 IC50 < quantile(IC50, de_comp_perc) ~ "2")) %>% # yes low, sensitive
+    filter(IC50_low %in% c("1", "2")) %>%
+    mutate(IC50_low = as.numeric(IC50_low)) %>%
+    select(cosmic_id, IC50_low, everything()) %>%
+    select(-c(IC50, AUC, tissue_label)) %>%
+    gather(gene_id, value, -cosmic_id) %>% # Transpose the df so that cell lines
+    spread(cosmic_id, value)               # (obs) are cols, genes (var) are rows
+  
+  # Step 5: 
+  expr_mat <- filtered_data %>%
+    filter(!(gene_id == "IC50_low")) %>% # extract IC50 var from df, leaving just expression
+    column_to_rownames(var = "gene_id")
+  
+  IC50_class <- filtered_data %>%
+    filter(gene_id == "IC50_low") %>%
+    select(-gene_id) 
+  IC50_class <- as.numeric(IC50_class) # convert single row to vector
+  
+  # For convenience when I'm writing methods
+  n_high <- length(IC50_class[IC50_class==1]) # high IC50, resistant
+  n_low <- length(IC50_class[IC50_class==2]) # low IC50, sensitive
+  
+  return(list(x = expr_mat, y = IC50_class, 
+              num_high = n_high, 
+              num_low = n_high))
+}
+
+gdsc_meta_epi %>%
+  group_by(tissue_label) %>%
+  summarise(n_lines = n()) %>%
+  arrange(desc(n_lines))
+
+
+res_lines <- list()
+sens_lines <- list()
+
+for (i in 1:length(test_groups)){ # run DE analysis for each of the data partitions
+    test_tidy_data_input <- tidy_gdsc %>% # remove 20% of the data from each fold
+      filter(!(cosmic_id %in% test_groups[[i]]))
+    test_input_de_data <- input_DE(tidy_data = test_tidy_data_input,
+                              de_comp_perc = de_comp_perc,
+                              rm_extreme_perc = 0.0)
+    res_lines[i] <- list(colnames(test_input_de_data$x)[test_input_de_data$y==1])
+    sens_lines[i] <- list(colnames(test_input_de_data$x)[test_input_de_data$y==2])
+    print(gdsc_meta_epi %>%
+            filter(cosmic_id %in% res_lines[[i]]) %>%
+            group_by(tissue_label) %>%
+            summarize(n_resistant = n()) %>%
+            arrange(desc(n_resistant)))
+    print(gdsc_meta_epi %>%
+            filter(cosmic_id %in% sens_lines[[i]]) %>%
+            group_by(tissue_label) %>%
+            summarize(n_sensitive = n()) %>%
+            arrange(desc(n_sensitive)))
+    }
+
+
+
+
+
+```
+
+
+## Differential expression analysis 
+
+```{r de_helpers, message=FALSE}
+
+sam_DE <- function(expr.lst, perm = 100){
+  # Function that runs SAMSeq algorithm
+  # Returns: vector of names of genes that are significantly differentially 
+  # expressed between the two groups. 
+  # print("SAM DE")
+  x <- as.matrix(expr.lst$x) # Expression values
+  y <- expr.lst$y # Class values
+  genenames <- as.character(row.names(x))
+  samfit <- SAM(x, y, resp.type="Two class unpaired", geneid = genenames,
+                genenames = genenames, logged2 = TRUE, fdr.output = 0.2,
+                testStatistic = "standard", nperms = perm, random.seed = 1)
+  lo.genes <- c()
+  up.genes <- c()
+  if (samfit$siggenes.table$ngenes.lo > 1) {
+    lo.genes <- samfit$siggenes.table$genes.lo[ , "Gene ID"]
+  }
+  if (samfit$siggenes.table$ngenes.lo == 1) {
+    lo.genes <- samfit$siggenes.table$genes.lo["Gene ID"]
+  }
+  if (samfit$siggenes.table$ngenes.up > 1) {
+    up.genes <- samfit$siggenes.table$genes.up[ , "Gene ID"]
+  }
+  if (samfit$siggenes.table$ngenes.up == 1) {
+    up.genes <- samfit$siggenes.table$genes.up["Gene ID"]
+  }
+  all.genes <- c(lo.genes, up.genes)
+  return(all.genes)
+}
+
+# sam_test <- sam_DE(test, perm = 100)
+
+limma_DE <- function(expr.lst){
+  # From the limma tutorial: 
+  # Limma works by fitting all of the data to a linear model, this models 
+  # the systemic part of the data. An empiracle Bayes method is then used for
+  # assessing differential expression. This moderates the standard errors of
+  # the estimated log-fold changes
+  # Returns: vector of names of genes that are significantly differentially 
+  # expressed between the two groups. 
+  # print("Limma DE")
+  data.mat <- expr.lst$x # Expression values, 
+  # log-ratios or log-expression values for a series of arrays, 
+  # with rows corresponding to genes and columns to samples.
+  data.class <- factor(expr.lst$y) # Class values
+  # eBayes fitting with treatment-contrasts parametrization
+  mm <- model.matrix(~data.class)
+  colnames(mm) <- c("Sensitive", "SensVSRes")
+  fit <- lmFit(data.mat, mm) # 
+  fit2 <- eBayes(fit, trend = TRUE, robust = FALSE)
+  tt <- topTable(fit2, number = Inf, p.value = 0.2, coef = "SensVSRes", 
+                 adjust.method = "none", lfc = 0.5)
+  return(row.names(tt))
+}
+
+# limma_test <- limma_DE(test)
+
+multtest_DE <- function(expr.lst, perm = 100){
+  # print("Multtest DE")
+  data.mat <- expr.lst$x # Expression values
+  data.class <- expr.lst$y # Class values
+  names(data.class) <- colnames(data.mat)
+  mtp.results <- MTP(X = data.mat, Y = data.class, test='t.twosamp.unequalvar', 
+                     typeone = 'fwer', alpha = 0.2, B=perm, 
+                     nulldist = 'boot.cs', method = 'ss.minP', seed = 1)
+  rejects <- rownames(expr.lst$x)[mtp.results@reject]
+  return(rejects)
+}
+
+# multtest_test <- multtest_DE(test, perm = 10)
+
+updown_genes <- function(expr.lst, de.genes){
+  ### This function will return two lists of up/down regulated 
+  ### genes when a cell line is sensitive to each drug. 
+  ### One list will contain genes that 
+  ### are up regulated in the lower responding cell lines, 
+  ### and one in the lower responding lines.
+  
+  ### The function will take a matrix (expr.lst$x) containing 
+  ### the expression values for the cell lines pertaining 
+  ### to the DE expression analysis being run. The cell lines (columns)
+  ### correspond to the class labels found in expr.lst$y.
+  ### Cell lines labeled '1' have a high AUC to the drug in 
+  ### question and cell lines labeled '2' have a low AUC 
+  ### to the drug in question.
+  
+  ### First, the matrix will be separated into high/low AUC
+  ### cell lines. Then, a loop will be run with the genes that are 
+  ### given as differentially expressed. The genes with a higher
+  ### average in the high AUC cell lines will be labeled as genes
+  ### whose expression is increased. Genes with a lower average in the
+  ### high AUC cell lines will be labeled as genes whose expression is 
+  ### decreased. 
+  
+  data.mat <- expr.lst$x # Expression values
+  data.class <- expr.lst$y # Class values
+  res.cells_lines <- data.mat[ , which(data.class == 1)] # Resistant, high AUC/IC50
+  sens.cell_lines <- data.mat[ , which(data.class == 2)] # Sensitive, low AUC/IC50
+  up.genes <- c() # Up in sensitive
+  down.genes <- c() # Down in sensitive
+  extra.genes <- c()
+  for(gene in de.genes){
+    mean.res <- rowMeans(res.cells_lines[gene, ]) # Mean expr in resistant
+    mean.sens <- rowMeans(sens.cell_lines[gene, ]) # Mean expr in sensitive
+    if (mean.sens > mean.res) { # Sensitive expr > resistant expr?
+      up.genes <- c(up.genes, gene) # High expr in sensitive = up-regulated
+    } else if (mean.sens < mean.res) { # Sensitive expr < resistant expr?
+      down.genes <- c(down.genes, gene) # Low expr in sensitive = down-regulated
+    } else {
+      extra.genes <- c(extra.genes, gene) # 
+    }
+  }
+  return(list(up = up.genes, down = down.genes, extra = extra.genes))
+}
+
+
+```
+
+## Run differential expression analysis
+
+```{r wrapper_run_DE, message=FALSE}
+
+
+all_DE <- function(tidy_data, de_comp_perc, rm_extreme_perc,
+                   sam_perm, mult_perm, n_folds){
+  # This wrapper function performs all the necessary steps to perform a
+  # differential expression analysis using limma, multtest, and SAM
+  # packages, then taking the intersection of those results. 
+  test_lines_list <- create_test_groups(tidy_data, n_folds, seed = 0)
+  sam_results <- list()
+  limma_results <- list()
+  multtest_results <- list()
+  
+  for (i in 1:length(test_lines_list)){ # run DE analysis for each of the data partitions
+    tidy_data_input <- tidy_data %>% # remove 20% of the data from each fold
+      filter(!(cosmic_id %in% test_lines_list[[i]]))
+    input_de_data <- input_DE(tidy_data = tidy_data_input, 
+                              de_comp_perc = de_comp_perc,
+                              rm_extreme_perc = rm_extreme_perc)
+    ### SAM Analysis ###
+    sam_DE_results <- sam_DE(input_de_data, perm = sam_perm)
+    sam_updown <- updown_genes(input_de_data, sam_DE_results)
+    sam_genes <- list(sam_up = sam_updown$up, sam_down = sam_updown$down)
+    sam_results[[i]] <- sam_genes
+
+    ### Limma Analysis ###
+    limma_DE_results <- limma_DE(input_de_data)
+    limma_updown <- updown_genes(input_de_data, limma_DE_results)
+    limma_genes <- list(limma_up = limma_updown$up, limma_down = limma_updown$down)
+    limma_results[[i]] <- limma_genes
+
+    ### multtest Analysis ###
+    multtest_DE_results <- multtest_DE(input_de_data, perm = mult_perm)
+    multtest_updown <- updown_genes(input_de_data, multtest_DE_results)
+    multtest_genes <- list(multtest_up = multtest_updown$up, multtest_down = multtest_updown$down)
+    multtest_results[[i]] <- multtest_genes
+  }
+  
+  results <- list(sam = sam_results,
+                  limma = limma_results,
+                  multtest = multtest_results,
+                  meta_params = list(de_comp_perc = de_comp_perc,
+                                     rm_extreme_perc = rm_extreme_perc,
+                                     sam_perm = sam_perm,
+                                     mult_perm = mult_perm,
+                                     n_folds = n_folds))
+  return(results)
+}
+
+
+```
+
+
+# Run DE
+
+This takes about 3.5 hours to run. 
+
+```{r run_DE, message=FALSE}
+
+results_DE <- all_DE(tidy_data = tidy_gdsc,
+               de_comp_perc = de_comp_perc,
+               rm_extreme_perc = rm_extreme_perc,
+               sam_perm = sam_perm,
+               mult_perm = mult_perm,
+               n_folds = n_folds)
+
+saveRDS(results_DE,
+        here("Results", drug, "DE",
+             paste0("all_results_",
+                    "deCompPerc", de_comp_perc*100,
+                    "_rmExtremePerc", rm_extreme_perc*100,
+                    "_samPerm", sam_perm,
+                    "_multPerm", mult_perm,
+                    "_nFolds", n_folds,
+                    ".rds")))
+
+results_DE <- readRDS(here("Results", drug, "DE",
+                           paste0("all_results_",
+                                  "deCompPerc", de_comp_perc*100,
+                                  "_rmExtremePerc", rm_extreme_perc*100,
+                                  "_samPerm", sam_perm,
+                                  "_multPerm", mult_perm,
+                                  "_nFolds", n_folds,
+                                  ".rds")))
+
+```
+
+## Extract seeds
+
+```{r extract_seeds}
+
+seeds_list_up <- list()
+
+for (i in 1:results_DE$meta_params$n_folds){
+  sam_up <- results_DE$sam[[i]]$sam_up
+  limma_up <- results_DE$limma[[i]]$limma_up
+  multtest_up <- results_DE$multtest[[i]]$multtest_up
+  seed_genes <- intersect(intersect(sam_up, limma_up), multtest_up)
+  seeds_list_up[[i]] <- seed_genes
+}
+
+seeds_df_up <- data.frame(lapply(seeds_list_up, function(x) {
+  x <- unlist(x)
+  length(x) <- max(lengths(seeds_list_up))
+  return(x)
+}))
+colnames(seeds_df_up) <- c("fold1", "fold2", "fold3", "fold4", "fold5")
+
+seeds_list_up[["params"]] <- results_DE$meta_params
+
+saveRDS(seeds_list_up, file = here("Results", drug, "DE",
+                                 paste0("DE_genes_up_",
+                                        "deCompPerc", de_comp_perc*100,
+                                        "_rmExtremePerc", rm_extreme_perc*100,
+                                        "_samPerm", sam_perm,
+                                        "_multPerm", mult_perm,
+                                        "_nFolds", n_folds, ".rds")))
+
+write.csv(seeds_df_up, file = here("Results", drug, "DE",
+                                 paste0("DE_genes_up_",
+                                        "deCompPerc", de_comp_perc*100,
+                                        "_rmExtremePerc", rm_extreme_perc*100,
+                                        "_samPerm", sam_perm,
+                                        "_multPerm", mult_perm,
+                                        "_nFolds", n_folds, ".csv")),
+          quote = FALSE, col.names = TRUE, row.names = FALSE)
+
+### down regulated genes
+
+seeds_list_down <- list()
+
+for (i in 1:results_DE$meta_params$n_folds){
+  sam_down <- results_DE$sam[[i]]$sam_down
+  limma_down <- results_DE$limma[[i]]$limma_down
+  multtest_down <- results_DE$multtest[[i]]$multtest_down
+  seed_genes <- intersect(intersect(sam_down, limma_down), multtest_down)
+  seeds_list_down[[i]] <- seed_genes
+}
+
+seeds_df_down <- data.frame(lapply(seeds_list_down, function(x) {
+  x <- unlist(x)
+  length(x) <- max(lengths(seeds_list_down))
+  return(x)
+}))
+colnames(seeds_df_down) <- c("fold1", "fold2", "fold3", "fold4", "fold5")
+
+seeds_list_down[["params"]] <- results_DE$meta_params
+
+saveRDS(seeds_list_down, file = here("Results", drug, "DE",
+                                 paste0("DE_genes_down_",
+                                        "deCompPerc", de_comp_perc*100,
+                                        "_rmExtremePerc", rm_extreme_perc*100,
+                                        "_samPerm", sam_perm,
+                                        "_multPerm", mult_perm,
+                                        "_nFolds", n_folds, ".rds")))
+
+write.csv(seeds_df_down, file = here("Results", drug, "DE",
+                                 paste0("DE_genes_down_",
+                                        "deCompPerc", de_comp_perc*100,
+                                        "_rmExtremePerc", rm_extreme_perc*100,
+                                        "_samPerm", sam_perm,
+                                        "_multPerm", mult_perm,
+                                        "_nFolds", n_folds, ".csv")),
+          quote = FALSE, col.names = TRUE, row.names = FALSE)
+
+
+```
+
+
+# Run co-expression network
+
+## Co-expression network helper functions
+
+```{r helper_coexp}
+
+calc_aff <- function(tcga_data_mat){
+  
+  # Returns matrix where rows are seed genes and columns are all other genes
+  # Values are rho from the spearman correlation between the row gene compared
+  # to the column gene.
+  
+  tcga_data_mat <- tcga_data_mat %>%
+    select(-tcga_label) %>%
+    column_to_rownames("sample_ID")
+  aff_mat <- cor(tcga_data_mat, method = "spearman")
+  return(aff_mat)
+}
+# 
+# test1 <- calc_aff(tcga_data[1:100, 1:100])
+# test1["A1BG", "A2M"] # sanity check
+# cor(tcga_data[1:100, 1:100]$A1BG, tcga_data[1:100, 1:100]$A2M, method = "spearman")
+
+convert_affinities <- function(aff_mat, seeds, alpha){
+  
+  # replace diagonal (where correlation is between the same gene) with NA
+  diag(aff_mat) <- NA 
+  aff_mat <- aff_mat[row.names(aff_mat) %in% seeds, ]
+
+  # Take top 5% of all values in matrix, set to 1 and others to 0
+  aff_quantile <- quantile(aff_mat, probs = (1-alpha), na.rm = TRUE)
+
+  # Convert score to 1 if greater or equal to the 95th percentile of affinity scores
+  aff_mat[aff_mat >= aff_quantile] <- 1
+  aff_mat[aff_mat < aff_quantile] <- 0
+  membership_mat <- aff_mat
+  return(membership_mat)
+}
+
+# test_seeds <- c("A2M", "ABCA3", "AARS")
+# test2 <- convert_affinities(test1, test_seeds, alpha = 0.05)
+# length(test2[test2==1])/length(test2)
+
+calc_conn <- function(membership_mat){
+  # Calculate average affinity of each gene to all seed genes
+  connect_vec <- apply(membership_mat, 2, mean, na.rm=TRUE)
+  names(connect_vec) <- colnames(membership_mat)
+  return(connect_vec)
+}
+
+# test3 <- calc_conn(test2)
+
+find_conn_seeds <- function(connectivity_vec, seeds, conn_cutoff_perc){
+  connect_quant <- quantile(connectivity_vec, 1-conn_cutoff_perc, na.rm=TRUE)
+  print(connect_quant)
+  top_conn_genes <- names(connectivity_vec[connectivity_vec >= connect_quant])
+  conn_seeds <- intersect(top_conn_genes, seeds)
+  return(conn_seeds)
+}
+
+# find_conn_seeds(test3, test_seeds, 0.20)
+# in this example, the top 80th percentile is still 0 so all genes will be included
+
+```
+
+## Run analysis
+
+We'll start by finding the connectivity vector (`connect_vec`) and save each step along the way. The first step doesn't require use of the seed genes; therefore, it only needs to be performed once. This takes about 20 minutes to run. 
+
+```{r run_aff}
+
+aff_mat <- calc_aff(tcga_data = tcga_data)
+
+```
+
+After these data are saved, we will convert the affinity matrix into the membership matrix, then produce the connectivity vector for each of the data partitions. From there, we'll determine which of our seed genes are highly connected in `connect_vec` for each data partition. These highly connected seed genes will be termed connectivity genes. 
+
+```{r find connect_genes}
+
+membership_mat_list <- list()
+connect_vec_list <- list()
+connect_genes_list <- list()
+
+for (i in 1:(length(seeds_list_up)-1)){
+  membership_mat_list[[i]] <- convert_affinities(aff_mat = aff_mat, 
+                                                 seeds = seeds_list_up[[i]], 
+                                                 alpha = 0.05)
+  connect_vec_list[[i]] <- calc_conn(membership_mat_list[[i]])
+  connect_genes_list[[i]] <- find_conn_seeds(connect_vec_list[[i]], 
+                                             seeds_list_up[[i]], 
+                                             conn_cutoff_perc = de_comp_perc)
+}
+
+saveRDS(membership_mat_list, file = here("Results", drug, "Coexpression",
+                                         paste0("membership_matrices_",
+                                                "deCompPerc", de_comp_perc*100,
+                                                "_rmExtremePerc", rm_extreme_perc*100,
+                                                "_samPerm", sam_perm,
+                                                "_multPerm", mult_perm,
+                                                "_nFolds", n_folds, ".rds")))
+
+saveRDS(connect_vec_list, file = here("Results", drug, "Coexpression",
+                                         paste0("connectivity_vectors_",
+                                                "deCompPerc", de_comp_perc*100,
+                                                "_rmExtremePerc", rm_extreme_perc*100,
+                                                "_samPerm", sam_perm,
+                                                "_multPerm", mult_perm,
+                                                "_nFolds", n_folds, ".rds")))
+
+saveRDS(connect_genes_list, file = here("Results", drug, "Coexpression",
+                                         paste0("connectivity_genes_",
+                                                "deCompPerc", de_comp_perc*100,
+                                                "_rmExtremePerc", rm_extreme_perc*100,
+                                                "_samPerm", sam_perm,
+                                                "_multPerm", mult_perm,
+                                                "_nFolds", n_folds, ".rds")))
+
+```
+
+
+## Extract final signature
+
+Our final signature will contain only genes that were found in at least 3 of the 5 connectivity gene lists. We'll extract those genes here. 
+
+```{r extract_sig}
+
+
+extract_sig <- function(conn_seeds_list){
+  count_vec <- unlist(conn_seeds_list)
+  conn_table <- data.frame(table(count_vec))
+  conn_over2 <- conn_table[conn_table$Freq>2, ]
+  conn_over2 <- as.character(conn_over2$count_vec)
+  return(conn_over2)
+}
+
+
+signature <- extract_sig(connect_genes_list)
+
+saveRDS(signature, file = here("Results", drug, 
+                                 paste0("intersect_sig_",
+                                        "deCompPerc", de_comp_perc*100,
+                                        "_rmExtremePerc", rm_extreme_perc*100,
+                                        "_samPerm", sam_perm,
+                                        "_multPerm", mult_perm,
+                                        "_nFolds", n_folds, ".rds")))
+
+print(drug)
+paste("Percentage of extreme response cell lines removed =", rm_extreme_perc)
+paste("DE Comparison Percentage =", de_comp_perc)
+paste("No. of data partitions for DE =", n_folds)
+paste("Connectivity Quantile = ", de_comp_perc)
+paste("SAM permutations =", sam_perm)
+paste("Multtest permutations =", mult_perm)
+paste("Signature =", str_flatten(signature, collapse = " "))
+
+
+
+```
+
+
+
+

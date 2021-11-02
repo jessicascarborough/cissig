@@ -1,0 +1,885 @@
+---
+title: "Plot Signature"
+author: "Jessica Scarborough"
+date: "7/25/2021"
+output: html_document
+---
+
+```{r setup, e=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(knitr)
+library(pheatmap)
+library(sigQC)
+library(magick)
+library(RColorBrewer)
+library(patchwork)
+library(survminer) # cell line persistence curves
+library(survival)
+library(here)
+library(ggExtra) # for adding histogram to scatterplot
+library(grid) # for adding histogram to scatterplot
+library(ggpubr)
+library(tidyverse)
+
+```
+
+# Load Data and Set Parameters
+
+We'll start by setting the drug of interest and our parameters for the signature we're interested in plotting.  
+
+```{r params}
+
+drug <- "Cisplatin"
+de_comp_perc = 0.20
+rm_extreme_perc = 0.0
+sam_perm = 10000
+mult_perm = 1000
+n_folds = 5
+
+```
+
+```{r load_data}
+
+load(here("Data", drug, "cleaned_gdsc_tcga.RData"))
+
+signature <- readRDS(file = here("Results", drug,
+                                 paste0("intersect_sig_",
+                                        "deCompPerc", (de_comp_perc*100),
+                                        "_rmExtremePerc", rm_extreme_perc*100,
+                                        "_samPerm", sam_perm,
+                                        "_multPerm", mult_perm,
+                                        "_nFolds", n_folds, ".rds")))
+
+```
+
+
+# Formatting helper
+
+```{r helper_formatting}
+
+format_model_data <- function(tidy_data, signature_genes, score_perc, IC50_perc,
+                              rm_extremes=FALSE){
+  # return data in tidied format with signature score (median expression of signature genes), 
+  # signature score class (high or low) and IC50 class (high or low)
+  
+  if(isTRUE(rm_extremes)){
+    tidy_data <- tidy_data %>%
+      filter(IC50 < quantile(IC50, 0.95) & 
+               IC50 > quantile(IC50, 0.05))
+  }
+  
+  complete_data <- tidy_data %>%
+    # mutate(IC50_high = ifelse(IC50 > median(IC50), 1, 0),
+    #        cosmic_id = as.character(cosmic_id)) %>%
+    mutate(cosmic_id = as.character(cosmic_id),
+      IC50_high = case_when(
+      IC50 >= quantile(IC50, 1-IC50_perc) ~ "Resistant",
+      IC50 < quantile(IC50, 1-IC50_perc) &
+        IC50 >= quantile(IC50, IC50_perc) ~ "NA",
+      IC50 < quantile(IC50, IC50_perc) ~ "Sensitive")) %>%
+    filter(IC50_high %in% c("Sensitive", "Resistant")) %>%
+    dplyr::select(cosmic_id, IC50, IC50_high, AUC, all_of(signature_genes)) %>%
+    mutate_at(signature_genes, scale) %>%
+    rowwise() %>% # allow for operations across rows
+    mutate(sig_score = median(c_across(5:(length(signature_genes)+4)))) %>% # take the median of only the signature genes 
+    ungroup() %>%
+    mutate(sig_score_high = case_when( # only e cell lines with extreme signature score (based on score_perc)
+      sig_score >= quantile(sig_score, 1-score_perc) ~ "High Signature Score",
+      sig_score < quantile(sig_score, 1-score_perc) &
+        sig_score >= quantile(sig_score, score_perc) ~ "NA",
+      sig_score < quantile(sig_score, score_perc) ~ "Low Signature Score")) %>%
+    filter(sig_score_high %in% c("Low Signature Score", "High Signature Score")) %>%
+    select(cosmic_id, IC50, IC50_high, AUC, sig_score, sig_score_high, all_of(signature_genes))
+  
+  return(complete_data)
+}
+
+tidy_signature_scorefilter <- format_model_data(tidy_data = tidy_gdsc, 
+                          signature_genes = signature,
+                          score_perc = 0.2,
+                          IC50_perc = 0.5)
+
+tidy_signature_IC50filter <- format_model_data(tidy_data = tidy_gdsc, 
+                          signature_genes = signature,
+                          score_perc = 0.5,
+                          IC50_perc = 0.2)
+
+tidy_signature <- format_model_data(tidy_data = tidy_gdsc, 
+                          signature_genes = signature,
+                          score_perc = 0.5,
+                          IC50_perc = 0.5)
+
+
+```
+
+
+
+# Plot subtype score violin
+
+## Format Data
+
+### GDSC
+
+```{r format_gdsc}
+# 
+# 
+# gdsc_signature <- gdsc_expr %>%
+#   select(cosmic_id, all_of(signature)) %>%
+#   inner_join(gdsc_meta_epi) %>%
+#   select(cosmic_id, tissue_label, tcga_label, all_of(signature)) %>%
+#   mutate_at(signature, scale) %>%
+#   rowwise() %>% # allow for operations across rows
+#   mutate(sig_score = median(c_across(4:(length(signature)+3))))
+
+gdsc_signature <- tidy_signature %>%
+  inner_join(gdsc_meta_epi)
+
+median_group_gdsc <- gdsc_signature %>%
+  group_by(tcga_label) %>%
+  summarize(median = median(sig_score), n = n()) %>%
+  arrange(desc(median)) %>%
+  dplyr::mutate(tcga_label = fct_reorder(tcga_label, dplyr::desc(median)))
+
+gdsc_signature$tcga_label <- factor(gdsc_signature$tcga_label, 
+                                      ordered = TRUE, 
+                                      levels = median_group_gdsc$tcga_label)
+
+```
+
+
+### TCGA 
+
+
+```{r format_tcga}
+
+tcga_signature <- tcga_data %>%
+  select(sample_ID, tcga_label, all_of(signature)) %>%
+  mutate_at(signature, scale) %>%
+  rowwise() %>% # allow for operations across rows
+  mutate(sig_score = median(c_across(3:(length(signature)+2)))) # manually check to make sure this works
+
+median_group_tcga <- tcga_signature %>%
+  group_by(tcga_label) %>%
+  summarize(median = median(sig_score), n = n()) %>%
+  arrange(desc(median))
+
+median_group_tcga <- median_group_tcga %>%
+  dplyr::mutate(tcga_label = fct_reorder(tcga_label, dplyr::desc(median)))
+
+tcga_signature$tcga_label <- factor(tcga_signature$tcga_label, ordered = TRUE,
+                                 levels = median_group_tcga$tcga_label)
+
+```
+
+### TCC
+
+```{r format_tcc}
+
+tcc_signature <- read.csv(here("Data", "TCC", "tcc_cis2_sig_result_20210930.csv")) %>%
+    mutate(tcga_label = tcc_label) %>%
+  mutate(tcga_label = str_replace(tcga_label, "PAM50_Normal", "BRCA"),
+         tcga_label = str_replace(tcga_label, "PAM50_LumA", "BRCA"),
+         tcga_label = str_replace(tcga_label, "PAM50_LumB", "BRCA"), 
+         tcga_label = str_replace(tcga_label, "Liver", "LIHC"), 
+         tcga_label = str_replace(tcga_label, "Esophagus", "ESCA"),
+         tcga_label = str_replace(tcga_label, "Cervix", "CESC"),
+         tcga_label = str_replace(tcga_label, "Large Bowel", "COAD/READ"),
+         tcga_label = str_replace(tcga_label, "Rectum-Anus", "COAD/READ"),
+         tcga_label = str_replace(tcga_label, "Head - Neck", "HNSC"),
+         tcga_label = str_replace(tcga_label, "Ovary", "OV"),
+         tcga_label = str_replace(tcga_label, "Stomach", "STAD"),
+         tcga_label = str_replace(tcga_label, "Bladder", "BLCA"),
+         tcga_label = str_replace(tcga_label, "PAM50_Her2", "BRCA"),
+         tcga_label = str_replace(tcga_label, "PAM50_Basal", "BRCA"),
+         tcga_label = str_replace(tcga_label, "Prostate", "PRAD"),
+         tcga_label = str_replace(tcga_label, "Pancreas", "PAAD"),
+         tcga_label = str_replace(tcga_label, "Endometrium/Uterus", "UCEC"),
+         tcga_label = str_replace(tcga_label, "Thyroid", "THCA")) %>%
+  filter(tcga_label %in% c("READ", "Kidney", "LUAD", "STAD", "BRCA", 
+                           "LIHC", "Renal Pelvis", "OV", "THCA", "COAD/READ", "PRAD", 
+                           "UCEC", "CESC", "BLCA", "LUSC", "HNSC", "PAAD", 
+                           "ESCA"))
+
+median_group_tcc <- tcc_signature %>% 
+  group_by(tcga_label) %>%
+  dplyr::summarize(median = median(median_expr), n = n()) %>%
+  arrange(desc(median)) 
+
+median_group_tcc <- median_group_tcc %>%
+  dplyr::mutate(tcga_label = fct_reorder(tcga_label, desc(median)))
+
+
+tcc_signature$tcga_label <- factor(tcc_signature$tcga_label, 
+                                   ordered =TRUE, 
+                                   levels = median_group_tcc$tcga_label)
+
+```
+
+
+
+
+## Make plots
+### GDSC
+
+```{r plot_violin_gdsc_sig}
+
+min_sig_score <- abs(min(gdsc_signature$sig_score))
+
+
+viol_data <- gdsc_signature %>%
+  mutate(sig_score = sig_score + (min_sig_score+1)) %>%
+  mutate(test = (min_sig_score+1)) %>%
+  filter(!is.na(tcga_label))%>%
+  filter(!tcga_label %in% c("", "ACC", "UNABLE TO CLASSIFY")) # remove ACC because there's only 1 value
+
+
+median_group_gdsc <- median_group_gdsc %>% 
+  filter(!is.na(tcga_label)) %>%
+  filter(!tcga_label %in% c("","ACC",  "UNABLE TO CLASSIFY"))
+
+violin_gdsc <- ggplot(viol_data, aes(x = tcga_label, y=sig_score)) +
+  # geom_point(median_epi_group_gdsc, aes(x = as.factor(tcga_label), y = median)) +
+  geom_violin(trim = FALSE, scale = "width", aes(fill=tcga_label)) +
+  geom_boxplot(width = 0.12, outlier.shape = NA) +
+  scale_y_continuous(trans="log2", expand = expansion(mult = 0.075)) +
+  # scale_x_discrete(expand = c(0,0)) +
+  geom_label(aes(x = tcga_label, y = .65, label = n), data = median_group_gdsc,
+             label.padding = unit(0.15, "lines"), label.size = 0.5, size = 8) +
+  coord_flip() +
+  labs(title = "Signature Score Distribution by Disease Site",
+       subtitle = "GDSC Dataset",
+       y = "Signature Score", x = "Disease Site") +
+  # ylab("Signature Score") + xlab("Cancer Subtype") + 
+  theme_bw(base_size = 17) +
+  theme(axis.text.y = element_text(angle = 30),
+        legend.position = "none",
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        axis.text = element_text(size = 25))
+
+ggsave(here("Results", drug, "Plots",
+            paste0("violin_subtypes_gdsc_",
+                   "deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")), 
+       violin_gdsc, width = 7.5, height = 10)
+
+
+
+
+```
+
+### TCGA
+```{r plot_violin_tcga_sig}
+
+min_sig_score <- abs(min(tcga_signature$sig_score))
+
+viol_data <- tcga_signature %>%
+  mutate(tcga_label = recode(tcga_label, COADREAD = "COAD/READ")) %>%
+  mutate(sig_score = sig_score + (min_sig_score+1)) %>%
+  mutate(test = (min_sig_score+1)) %>%  
+  # mutate(tcga_label = replace(tcga_label, tcga_label=="COADREAD", "COAD/READ")) %>%
+  filter(!is.na(tcga_label))%>%
+  filter(!tcga_label %in% c("", "UNABLE TO CLASSIFY"))
+
+
+median_group_tcga <- median_group_tcga %>% 
+  mutate(tcga_label = recode(tcga_label, COADREAD = "COAD/READ")) %>%
+  filter(!is.na(tcga_label)) %>%
+  filter(!tcga_label %in% c("", "UNABLE TO CLASSIFY"))
+
+violin_tcga <- ggplot(viol_data, aes(x = tcga_label, y=sig_score)) +
+  geom_violin(trim = FALSE, scale = "width", aes(fill=tcga_label)) +
+  geom_boxplot(width = 0.12, outlier.shape = NA) +
+  scale_y_continuous(trans="log2", expand = expansion(mult = 0.11)) +
+  # scale_x_discrete(expand = c(0,0)) +
+  geom_label(aes(x = tcga_label, y = .85, label = n), data = median_group_tcga,
+             label.padding = unit(0.15, "lines"), label.size = 0.5, size = 8) +
+  coord_flip() +
+  labs(title = "Signature Score Distribution by Disease Site",
+       subtitle = "TCGA Dataset",
+       y = "Signature Score", x = "Disease Site") +
+  # ylab("Signature Score") + xlab("Cancer Subtype") + 
+  theme_bw(base_size = 17) +
+  theme(axis.text.y = element_text(angle = 30),
+        legend.position = "none",
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        axis.text = element_text(size = 25))
+
+
+ggsave(here("Results", drug, "Plots",
+            paste0("violin_subtypes_tcga_",
+                   "deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")), 
+       violin_tcga, width = 7.5, height = 10)
+
+```
+
+
+### TCC 
+
+```{r plot_violin_tcc_sig}
+
+viol_data <- tcc_signature
+viol_data$median_expr <- viol_data$median_expr + (abs(min(viol_data$median_expr))+1)
+
+violin_tcc <- ggplot(viol_data, aes(x = tcga_label, y=median_expr)) +
+  geom_violin(trim = FALSE, scale = "width", aes(fill=tcga_label)) +
+  geom_boxplot(width = 0.12, outlier.shape = NA) +
+  scale_y_continuous(trans="log2", expand = expansion(mult = 0.11)) +
+  # scale_x_discrete(expand = c(0,0)) +
+  geom_label(aes(x = tcga_label, y = .65, label = n), data = median_group_tcc,
+             label.padding = unit(0.15, "lines"), label.size = 0.5, size = 8) +
+  coord_flip() +
+  labs(title = "Signature Score Distribution by Disease Site",
+       subtitle = "TCC Dataset",
+       y = "Signature Score", x = "Disease Site") +
+  # ylab("Signature Score") + xlab("Cancer Subtype") + 
+  theme_bw(base_size = 17) +
+  theme(axis.text.y = element_text(angle = 30),
+        legend.position = "none",
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        axis.text = element_text(size = 25))
+
+ggsave(here("Results", drug, "Plots",
+            paste0("violin_subtypes_tcc_",
+                   "deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")), 
+       violin_tcc, width = 7.5, height = 10)
+
+
+```
+
+
+
+
+### Compare ranks
+
+### Compare rankings in GDSC and TCGA
+
+
+```{r compare_css_gdsc_tcga}
+
+# rank gdsc
+gdsc_labels_ranked <- data.frame(median_group_gdsc$tcga_label,
+                                 seq(1, length(median_group_gdsc$tcga_label)))
+colnames(gdsc_labels_ranked) <- c("tcga_label", "gdsc_rank")
+
+# rank tcga
+tcga_labels_ranked <- data.frame(median_group_tcga$tcga_label,
+                                 seq(1, length(median_group_tcga$tcga_label)))
+colnames(tcga_labels_ranked) <- c("tcga_label", "tcga_rank")
+
+# rank tcc
+tcc_labels_ranked <- data.frame(median_group_tcc$tcga_label, 
+                                seq(1, length(median_group_tcc$tcga_label)))
+colnames(tcc_labels_ranked) <- c("tcga_label", "tcc_rank")
+
+
+# combine into easy to read data frame
+combined_labels_ranked <- merge(gdsc_labels_ranked, tcga_labels_ranked, by = "tcga_label")
+combined_labels_ranked <- merge(combined_labels_ranked, 
+                                tcc_labels_ranked, 
+                                by = "tcga_label", all.x = TRUE)
+
+
+cor.test(combined_labels_ranked$gdsc_rank, combined_labels_ranked$tcga_rank)
+cor.test(combined_labels_ranked$gdsc_rank, combined_labels_ranked$tcc_rank)
+cor.test(combined_labels_ranked$tcga_rank, combined_labels_ranked$tcc_rank)
+
+
+
+
+```
+
+# Cell line persistence plots in GDSC
+
+## Helper functions
+
+```{r helpers_persistence}
+
+plot_persistence <- function(fit, data, group_name){
+  
+  surv_median_high <- summary(fit)$table[,'median'][1]
+  surv_median_low <- summary(fit)$table[,'median'][2]
+  
+  g1 <- ggsurvplot(fit, data = data, palette = c("#B2182B", "#2166AC"),
+           risk.table = FALSE, pval = TRUE, conf.int = TRUE,
+           ggtheme = theme_survminer(font.tickslab = c(15, "plain", "black")))
+  return(g1$plot +
+    geom_segment(aes(x = 0, y = 0.5, 
+                     xend = surv_median_low, yend = 0.5),
+                 linetype = "dashed", size = 1.25) +  # horizontal segment
+    geom_segment(aes(x = surv_median_high, y = 0, 
+                     xend = surv_median_high, yend = 0.5),
+                 linetype = "dashed", size = 1.25) +
+    geom_segment(aes(x = surv_median_low, y = 0, 
+                     xend = surv_median_low, yend = 0.5),
+                 linetype = "dashed", size = 1.25))
+}
+
+run_persistence <- function(tidy_data){
+
+  hr <- exp(coef(coxph(Surv(IC50)~sig_score_high, data = tidy_data)))
+  fit <- survfit(Surv(IC50)~sig_score_high, data = tidy_data)
+
+  return(list(hr = hr,
+              fit = fit,
+              data = tidy_data))
+}
+
+
+
+plot_null_persistence <- function(null_metrics, test_metric, metric_name, group_name){
+  null <- data.frame(metric = null_metrics)
+  plot_name <- here("Results", drug, "Plots",
+                    paste0("nulldistribution_KM_", group_name, 
+                           "_deCompPerc", (de_comp_perc*100),
+                           "_rmExtremePerc", rm_extreme_perc*100,
+                           "_multPerm", mult_perm,
+                           "_nFolds", n_folds, ".png"))
+  png(filename = plot_name, width = 1500, height = 1500, res = 250)
+  quantile_975 <- quantile(null_metrics, 0.975)
+  quantile_500 <- quantile(null_metrics, 0.5)
+  quantile_025 <- quantile(null_metrics, 0.025)
+  quantile_05 <- quantile(null_metrics, 0.05)
+  null_km_plot <- ggplot(null, aes(x = metric)) +
+    geom_histogram(bins = 20, fill = "#e1d5c9", color = "black") +
+    geom_vline(xintercept = test_metric, colour = "red", size = 2) +
+    # geom_vline(xintercept = quantile_975,
+    #            linetype = "dashed", colour = "red", size = 2) +
+    geom_vline(xintercept = quantile_500, colour = "seashell4", size = 2) +
+    # geom_vline(xintercept = quantile_025,
+    #            linetype = "dashed", colour = "red", size = 2) +
+    geom_vline(xintercept = quantile_05,
+               linetype = "dashed", colour = "seashell4", size = 2) +
+    scale_x_continuous(trans='log2', 
+                       breaks = c(1.5, quantile_500, quantile_05, test_metric),
+                       labels = function(x) format(x, scientific = FALSE, digits = 3)) +
+    ggtitle(label = paste("Null Distribution of", metric_name, "in", "Persistance Curves"),
+            subtitle = paste("Comparing Top/Bottom Signature Expression", group_name)) +
+    labs(x = metric_name) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5),
+          axis.text = element_text(size = 15),
+          plot.margin = unit(c(1,1,1,1), "cm"),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  print(null_km_plot)
+  dev.off()
+  return(null_km_plot)
+}
+
+```
+
+## Signature persistence curve 
+
+### Complete dataset
+
+```{r plot_persistence_complete}
+
+persistence_halves <- run_persistence(tidy_data = tidy_signature)
+
+plot_persistence(persistence_halves$fit, 
+                 data = persistence_halves$data, 
+                 group_name = "halves")
+
+```
+
+
+### Most extreme drug response dataset
+```{r plot_persistence_quintiles}
+
+persistence_quintiles <- run_persistence(tidy_data = tidy_signature_scorefilter)
+
+pers_quintiles_plot <- plot_persistence(persistence_quintiles$fit, 
+                 data = persistence_quintiles$data, 
+                 group_name = "quintiles")
+
+persistence_quintiles$fit
+
+ggsave(here("Results", drug, "Plots",
+           paste0("km_survival_", "quintiles", 
+                  "_deCompPerc", (de_comp_perc*100),
+                  "_rmExtremePerc", rm_extreme_perc*100,
+                  "_samPerm", sam_perm,
+                  "_multPerm", mult_perm,
+                  "_nFolds", n_folds, ".png")), pers_quintiles_plot,
+       height = 5, width = 8)
+
+
+```
+
+## Null persistance curves
+
+### Complete dataset
+```{r run_null_sigs_halves}
+
+n <- 1000
+null_sigs <- list()
+null_input <- list()
+i <- 1
+
+# get input data for each null signature
+
+for (seed in 2021:(2021+(n-1))) { # run this n times, with a random seed
+  set.seed(seed)
+  random_sig <- sample(colnames(gdsc_expr)[2:(length(colnames(gdsc_expr)))], size = length(signature), 
+                       replace = FALSE, prob = NULL)
+  null_sigs[[i]] = random_sig
+  null_input[[i]] = format_model_data(tidy_data = tidy_gdsc, 
+                                      signature_genes = random_sig,
+                                      score_perc = 0.5,
+                                      IC50_perc = 0.5)
+  i <- i + 1
+}
+
+pred_halves_null <- lapply(null_input, FUN = function(data) run_persistence(data))
+names(pred_halves_null) <- 1:n
+
+
+hr_halves_null <- c()
+
+for (i in 1:length(pred_halves_null)){
+  hr_halves_null <- c(hr_halves_null, pred_halves_null[[i]]$hr)
+}
+
+km_surv_null_halves <- plot_null_persistence(null_metrics = hr_halves_null, 
+                                             test_metric = persistence_halves$hr, 
+                                             metric_name = "HR", 
+                                             group_name = "Halves")
+
+ggsave(here("Results", drug, "Plots",
+            paste0("km_survival_null_halves",
+                   "deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       km_surv_null_halves, height = 5, width = 7.5)
+
+```
+
+
+### Most extreme signature scores
+
+```{r run_null_sigs_quintiles}
+
+n <- 1000
+null_sigs <- list()
+null_input <- list()
+i <- 1
+
+# get input data for each null signature
+
+for (seed in 2021:(2021+(n-1))) { # run this n times, with a random seed
+  set.seed(seed)
+  random_sig <- sample(colnames(gdsc_expr)[2:(length(colnames(gdsc_expr)))], size = length(signature), 
+                       replace = FALSE, prob = NULL)
+  null_sigs[[i]] = random_sig
+  null_input[[i]] = format_model_data(tidy_data = tidy_gdsc, 
+                                      signature_genes = random_sig,
+                                      score_perc = 0.2,
+                                      IC50_perc = 0.5)
+  i <- i + 1
+}
+
+pred_quintiles_null <- lapply(null_input, FUN = function(data) run_persistence(data))
+names(pred_quintiles_null) <- 1:n
+
+
+hr_quintiles_null <- c()
+
+for (i in 1:length(pred_quintiles_null)){
+  hr_quintiles_null <- c(hr_quintiles_null, pred_quintiles_null[[i]]$hr)
+}
+
+km_surv_null_quintiles <- plot_null_persistence(null_metrics = hr_quintiles_null, 
+                      test_metric = persistence_quintiles$hr, 
+                      metric_name = "HR", 
+                      group_name = "Quintiles")
+
+ggsave(here("Results", drug, "Plots",
+            paste0("km_survival_null_quintiles",
+                   "deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       km_surv_null_quintiles, height = 5, width = 7.5)
+
+```
+
+# Heatmap comparing sensitive and resistant lines
+
+```{r format_heatmap}
+
+format_heatmap <- function(tidy_data, z_cutoff, sig_genes = signature){
+  # change old name, C15orf41 to CDIN1
+  new_cols <- colnames(tidy_data)
+  new_cols[new_cols=="C15orf41"] <- "CDIN1"
+  colnames(tidy_data) <- new_cols 
+  sig_genes[sig_genes=="C15orf41"] <- "CDIN1"
+  
+  complete_data <- tidy_data %>%
+    select(cosmic_id, IC50, IC50_high, all_of(sig_genes)) %>%
+    arrange(desc(IC50))
+
+  class_data <- complete_data %>%
+    select(cosmic_id, IC50_high) %>%
+    # mutate(IC50_high = factor(IC50_high)) %>%
+    column_to_rownames("cosmic_id")
+
+  expr_data <- complete_data %>%
+    select(cosmic_id, all_of(sig_genes)) %>%
+    column_to_rownames("cosmic_id")
+  
+  cell_line_names <- row.names(expr_data)
+  expr_data <- t(expr_data)
+  colnames(expr_data) <- cell_line_names
+
+  expr_data[expr_data > z_cutoff] <- z_cutoff
+  expr_data[expr_data < -z_cutoff] <- -z_cutoff
+  
+  return(list(complete_data = complete_data,
+              class_data = class_data, 
+              expr_data = expr_data))
+}
+
+heatmap_input <- format_heatmap(tidy_signature_IC50filter, z_cutoff= 2.5)
+
+```
+
+
+```{r plot_heatmap}
+  
+setHook("grid.newpage",
+      function() pushViewport(
+        viewport(x=1,y=1,width=0.9, height=0.9,
+                 name="vp", just=c("right","top"))), action="prepend")
+  
+pheatmap(heatmap_input$expr_data, treeheight_row = 0, treeheight_col = 0,
+         show_rownames = TRUE, show_colnames = FALSE, border_color = NA, 
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         height = 6, width = 10,
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         gaps_col = ncol(heatmap_input$expr_data)/2,
+         annotation_colors = list(IC50_high = c(Resistant="darkseagreen4", Sensitive = "palegoldenrod")),
+         annotation_col = heatmap_input$class_data, annotation_names_col = FALSE,
+         fontsize = 17,
+         main = "Gene Expression of Signature between Quintiles",
+         filename = here("Results", drug, "Plots",
+                         paste0("signature_heatmap_",
+                                "deCompPerc", (de_comp_perc*100),
+                                "_rmExtremePerc", rm_extreme_perc*100,
+                                "_multPerm", mult_perm,
+                                "_nFolds", n_folds, ".png")))
+
+setHook("grid.newpage", NULL, "replace")
+grid.text("Epithelial Cell Lines", y=-0.01, x = 0.4, gp=gpar(fontsize=10))
+grid.text("Signature Genes", x=-0.01, y=0.45,rot=90, gp=gpar(fontsize=10))
+
+
+```
+
+
+# Distribution of sig score and IC50
+
+```{r distribution_score_IC50}
+
+
+plot_drug_response <- function(tidy_data){
+  ggplot(tidy_data, aes(x = IC50)) +
+    geom_histogram(binwidth = 0.5) +
+    geom_density(aes(y=0.5*..count.., fill = "color"), alpha = 0.3, size = 1) +
+    scale_fill_manual(values = "cornflowerblue") +
+    geom_vline(xintercept = median(tidy_data$IC50), colour = "red", size = 1) +
+    ggtitle(label = paste("Distribution of Cisplatin IC50"),
+            subtitle = paste(nrow(tidy_data), "epithelial-based GDSC cell lines")) +
+    xlab("log2(IC50)") + ylab("Count") +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5,
+                                    size = 20),
+          plot.subtitle = element_text(hjust = 0.5,
+                                       size = 15),
+          axis.text = element_text(size = 15),
+          legend.position = "none")
+}
+
+p1 <- plot_drug_response(tidy_data = tidy_gdsc)
+
+plot_sig_scores <- function(gdsc_signature){
+  ggplot(gdsc_signature, aes(x = sig_score)) +
+    geom_histogram(binwidth = 0.05) +
+    geom_density(aes(y=0.05*..count.., fill = "color"), alpha = 0.3, size = 1) +
+    scale_fill_manual(values = "cornflowerblue") +
+    geom_vline(xintercept = quantile(gdsc_signature$sig_score, 0.5), colour = "red", size = 1) +
+    ggtitle(label = "Distribution of Signature Scores",
+            subtitle = paste(nrow(gdsc_signature), "epithelial-based GDSC cell lines")) +
+    xlab("Signature Score") + ylab("Count") +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5, size = 20),
+          plot.subtitle = element_text(hjust = 0.5, size = 15),
+          axis.text = element_text(size = 15),
+          legend.position = "none")
+}
+
+p2 <- plot_sig_scores(tidy_signature)
+
+
+ggsave(here("Results", drug, "Plots",
+            paste0("supps_IC50_distribution_",
+                   "deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       p1, height = 5, width = 10)
+
+ggsave(here("Results", drug, "Plots",
+            paste0("supps_score_distribution_",
+                   "deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")), 
+       p2, height = 5, width = 10)
+
+p_both <- p1 + p2 +   plot_annotation(tag_levels = 'A') 
+ggsave(here("Results", drug, "Plots",
+            paste0("supps_score_IC50_distribution_",
+                   "deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       p_both, dpi = 300, height = 5, width = 10)
+
+
+```
+
+
+# AUC vs IC50
+
+```{r AUCvsIC50}
+
+corr_val <- cor.test(tidy_gdsc$IC50, tidy_gdsc$AUC, method = "spearman")
+
+
+p_dr <- ggplot(tidy_gdsc, aes(x = AUC, y = IC50)) + 
+  geom_point(size=5, alpha = 0.5, color = "black") + 
+  annotate("text", x = 0.7, y = 5, vjust = 0, size = 5,
+           label = paste("spearman rho =",sprintf("%.3f",corr_val$estimate))) +
+  annotate("text", x = 0.7, y = 4, vjust = 0, size = 5,
+           label = "p < 2.2e-16") + # because it's reporting 0
+  labs(x = "AUC", y = "IC50") + 
+  coord_cartesian(clip = 'off') +
+  ggtitle("AUC vs. IC50\nin 430 Epithelial GDSC Cell Lines") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 20),
+        axis.text = element_text(size = 15),
+        plot.title = element_text(size = 25, hjust = 0.5))
+
+p_dr <- ggExtra::ggMarginal(p_dr, type = "histogram", size = 10,
+                            color = "white", fill = "cornflowerblue")
+
+
+ggsave(here("Results", drug, "Plots",
+            paste0("supps_AUCvIC50_",
+                   "deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       p_dr, height = 9, width = 9)
+
+```
+
+
+# Signature Score violin by drug response
+
+```{r score_violin_by_response}
+
+plot_violin_score <- function(score_IC50_data, group_name){
+  ggplot(score_IC50_data, aes(x = factor(IC50_high), y = sig_score)) + 
+    geom_violin(trim = FALSE, aes(fill=factor(IC50_high))) + 
+    geom_boxplot(width = 0.06, outlier.shape = NA) +
+    scale_fill_manual(values = c("darkseagreen4", "palegoldenrod"),
+                      name = "IC50") +
+    ggtitle(paste0("Comparing Signature score between best and worst 
+                   cisplatin responders \n(by ", group_name, ")")) +
+    labs(x = "Cell Line Cohort",y = "Signature Score") + 
+    stat_compare_means(method="wilcox.test", label.x = 1.4, label.y = 2.2, size = 7) +
+    ylim(-2, 2.5) + 
+    theme_bw(base_size = 22) + 
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none")
+}
+
+ggsave(here("Results", drug, "Plots",
+            paste0("violin_score_",
+                   "deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       plot_violin_score(score_IC50_data = tidy_signature_IC50filter, 
+                         group_name = "quintiles"),
+       height = 7,
+       width = 9)
+
+
+
+```
+
+
+# SigQC
+
+
+SigQC is a useful package created by Dr. Andrew Dhawan. It was inspired by a need to compare signatures between datasets. Here we compare the differentially expressed genes from each of the 5 runs and the signature genes within the TCGA epithelial-based expression. Metrics regarding skew, intra-signature correlation, variation carried in the first principal componant, and more are measured. Because the datasets are large, the PCA analysis requires a long time to run. All of the results are stored in the following file path `Plots/Epithelial_Complete/SigQC`. If you wish to run the analysis, simply uncomment the last line. Additionally, a summary plot is added below.  Finally, if you wish to run the analysis in a different dataset (such as the GDSC expression data), you may uncomment the third line of code in this chunk.
+
+
+```{r run_sigQC, include=FALSE}
+
+mRNA_expr_matrix <- list()
+
+mRNA_expr_matrix[["tcga"]] <- data.frame(t(as.matrix(tcga_data %>% select(-c(sample_ID, tcga_label)))))
+
+gene_sigs_list <- list()
+gene_sigs_list[["final_sig"]] <- signature
+
+seeds_list <- readRDS(file = here("Results", drug, "DE",
+                                 paste0("DE_genes_",
+                                        "deCompPerc", de_comp_perc*100,
+                                        "_rmExtremePerc", rm_extreme_perc*100,
+                                        "_samPerm", sam_perm,
+                                        "_multPerm", mult_perm,
+                                        "_nFolds", n_folds, ".rds")))
+
+gene_sigs_list[["DE_Results_1"]] <- seeds_list[[1]]
+gene_sigs_list[["DE_Results_2"]] <- seeds_list[[2]]
+gene_sigs_list[["DE_Results_3"]] <- seeds_list[[3]]
+gene_sigs_list[["DE_Results_4"]] <- seeds_list[[4]]
+gene_sigs_list[["DE_Results_5"]] <- seeds_list[[5]]
+
+
+showResults <- FALSE # we do not want to show the results in R graphics windows
+doNegativeControl <- TRUE
+boot_n <- 50
+
+make_all_plots(gene_sigs_list, mRNA_expr_matrix, showResults = showResults,
+               doNegativeControl = FALSE,
+               out_dir = "../Results/Cisplatin/SigQC")
+
+```
+
+<!-- ![SigQC Radar Plot](../Results/Cisplatin/SigQC/sig_radarplot.png) -->
+
+
+

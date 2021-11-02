@@ -1,0 +1,1994 @@
+---
+title: "Signature Modeling"
+author: "Jessica Scarborough"
+date: "7/23/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load_packages, warning=FALSE}
+# library(penalized) # penalized linear and logistic regression
+library(stringr)
+library(pROC) # roc curves from classified responses
+library(e1071) # svm
+library(randomForest)
+library(here)
+library(glmnet) # penalized linear and logistic regression
+library(patchwork)
+# library(ggpubr)
+library(tidyverse)
+library(patchwork)
+
+```
+
+Let's check the arguments inputted using the command line. 
+
+```{r command_args}
+args <- commandArgs(trailingOnly = TRUE) # load arguments from job submission 
+# args[1] contains the data variable (`h` or `q`)
+# args[2] contains the bootstrapping `n`
+# args[3] contains the drug name
+# args[4] contains the de percentage for reading in the file name
+
+print(args) # confirm they were loaded correctly
+
+```
+
+
+In order to run this file as an RMarkdown document, we'll set the args variables manually here. Using `purl=FALSE`, this chunk will be ignored during conversion to the RScript. 
+
+```{r manual_args, purl=FALSE}
+
+# for running the script without the cluster
+
+args[1] <- "q" # quintiles or halves 
+args[2] <- 1000 # bootstrap n
+args[3] <- "Cisplatin" # drug name
+args[4] <- .20 # DE comparison percentage
+
+```
+
+We'll convert these arguments to easier to read variables. 
+
+```{r convert_args}
+
+n <- as.numeric(args[2])
+drug <- args[3]
+de_comp_perc <- as.numeric(args[4])
+
+```
+
+
+Here are some arguments we don't expect to change between runs, so we'll hard code them in. 
+
+```{r static_args}
+
+rm_extreme_perc = 0.0
+sam_perm = 10000
+mult_perm = 1000
+n_folds = 5
+
+```
+
+
+
+```{r load_data}
+
+load(here("Data", drug, "cleaned_gdsc_tcga.RData"))
+
+# signature <- readRDS(file = here("Results", drug,
+#                                  paste0("intersect_sig_",
+#                                         "deCompPerc", (de_comp_perc*100),
+#                                         "_rmExtremePerc", rm_extreme_perc*100,
+#                                         "_samPerm", sam_perm,
+#                                         "_multPerm", mult_perm,
+#                                         "_nFolds", n_folds, ".rds")))
+
+signature <- readRDS(paste0("~/working-cissig/Results/",
+                            drug,
+                            "/intersect_sig_",
+                            "deCompPerc", (de_comp_perc*100),
+                            "_rmExtremePerc", rm_extreme_perc*100,
+                            "_samPerm", sam_perm,
+                            "_multPerm", mult_perm,
+                            "_nFolds", n_folds, ".rds"))
+
+```
+
+
+# Helper Functions
+
+## Data formatting
+
+```{r helper_fns}
+
+format_model_data <- function(tidy_data, signature_genes, score_perc, 
+                              rm_extremes=FALSE){
+  # return data in tidied format with signature score (median expression of signature genes), 
+  # signature score class (high or low) and IC50 class (high or low)
+  
+  if(isTRUE(rm_extremes)){
+    tidy_data <- tidy_data %>%
+      filter(IC50 < quantile(IC50, 0.95) & 
+               IC50 > quantile(IC50, 0.05))
+  }
+  
+  complete_data <- tidy_data %>%
+    mutate(IC50_high = ifelse(IC50 >= median(IC50), 1, 0),
+           cosmic_id = as.character(cosmic_id)) %>%
+    dplyr::select(cosmic_id, IC50, IC50_high, all_of(signature_genes)) %>%
+    mutate_at(signature_genes, scale) %>%
+    rowwise() %>% # allow for operations across rows
+    mutate(sig_score = median(c_across(4:(length(signature_genes)+3)))) %>% # take the median of only the signature genes
+    ungroup() %>%
+    mutate(sig_score_high = case_when( # only include cell lines with extreme signature score (based on score_perc)
+      sig_score >= quantile(sig_score, 1-score_perc) ~ 1,
+      sig_score < quantile(sig_score, 1-score_perc) &
+        sig_score >= quantile(sig_score, score_perc) ~ as.numeric(NA),
+      sig_score < quantile(sig_score, score_perc) ~ 0)) %>%
+    filter(sig_score_high %in% c(1, 0)) %>%
+    select(cosmic_id, IC50, IC50_high, sig_score, sig_score_high, all_of(signature_genes))
+  
+  return(complete_data)
+  }
+
+# test <- format_model_data(tidy_data = tidy_gdsc, signature_genes = signature,
+#                           score_perc = 0.5)
+
+
+create_test_groups <- function(tidy_data, n_folds, seed = NA){
+  # This helper function takes our tidied data, and returns cell lines 
+  # separated into a given number of folds (`n_folds`)
+  if(is.na(seed)==FALSE){
+    set.seed(seed)
+  }
+  shuffled_lines <- tidy_data$cosmic_id[sample(nrow(tidy_data), replace = FALSE)]
+  folds <- cut(seq(1, length(shuffled_lines)), breaks = n_folds, labels = FALSE)
+  
+  testing_sets <- list()
+  for(i in 1:n_folds){
+    test_lines <- shuffled_lines[folds==i]
+    testing_sets[[i]] <- test_lines
+  }
+  return(testing_sets)
+}
+
+# test_groups <- create_test_groups(test, n_folds = 5, seed = 1)
+
+
+```
+
+## Model running
+
+```{r run_model_helpers, warning=FALSE, echo=TRUE, results='hide', message=FALSE}
+
+runLinReg <- function(modeling_data){
+
+  # Fit model with training data 
+  # Using signature score to predict IC50 as a continuous variable
+  fit <- lm(IC50 ~ sig_score, data = modeling_data[["training_data"]])
+  
+  # Perform prediction with testing data
+  pred <- predict(fit, modeling_data[["testing_data"]])
+  
+  # Assess prediction accuracy
+  regr_results <- cor.test(pred, modeling_data[["testing_data"]]$IC50, method = "spearman")
+  spearman_rho <- regr_results$estimate
+  spearman_p <- regr_results$p.value
+  
+  # Store resulting model, results, and included data
+  return(list(fit = fit,
+              results = c(spearman_rho = spearman_rho,
+                          spearman_p = spearman_p,
+                          lm_R2 = summary(fit)$r.squared,
+                          lm_p = lmp(fit)),
+              predictions = data.frame(actual = modeling_data[["testing_data"]]$IC50,
+                                       predicted = pred),
+              cell_lines = list(training_lines = modeling_data[["training_data"]]$cosmic_id,
+                                testing_lines = modeling_data[["testing_data"]]$cosmic_id)))
+}
+
+
+runLogReg <- function(modeling_data){
+  # Fit model with training data
+  # Using signature score to predict IC50 as a binary variable
+  fit <- glm(IC50_high ~ sig_score, data = modeling_data[["training_data"]], family = "binomial")
+  # Perform prediction with testing data
+  prob <- predict(fit, newdata = modeling_data[["testing_data"]], type = "response")
+  # Extract prediction probabilities for all testing samples
+  predict_df <- data.frame(predictions = prob,
+                           labels = modeling_data[["testing_data"]]$IC50_high)
+  # Store resulting model, probabilities, and included data
+  return(list(fit = fit,
+              results = c(auc(roc(predict_df$labels, predict_df$predictions, quiet=TRUE))),
+              predictions = predict_df,
+              cell_lines = list(training_lines = modeling_data[["training_data"]]$cosmic_id,
+                                testing_lines = modeling_data[["testing_data"]]$cosmic_id)))
+}
+
+runPenLinReg <- function(modeling_data, signature_genes, alpha = c(0, 0.5, 1)){
+  # alpha = 0 for ridge regression (L2)
+  # alpha = 1 for lasso regression (L1)
+  # alpha = 0.5 for elastic regression 
+
+  # Format data
+  training_x <- modeling_data[["training_data"]] %>%
+    dplyr::select(all_of(signature_genes))
+  training_y <- modeling_data[["training_data"]] %>%
+    dplyr::select(IC50)
+
+  testing_x <- modeling_data[["testing_data"]] %>%
+    dplyr::select(all_of(signature_genes))
+  testing_y <- modeling_data[["testing_data"]] %>%
+    dplyr::select(IC50)
+  
+  cv <- cv.glmnet(x = as.matrix(training_x),
+            y = as.matrix(training_y), 
+            alpha = alpha)
+  fit <- glmnet(x = as.matrix(training_x),
+                y = as.matrix(training_y), 
+                alpha = alpha,
+                lambda = cv$lambda.min, 
+                family = "gaussian")
+  
+  pred <- predict(fit, newx = as.matrix(testing_x), type = "response")
+  regr_results <- cor.test(pred, as.matrix(testing_y), method = "spearman")
+  
+  spearman_rho <- regr_results$estimate
+  spearman_p <- regr_results$p.value
+  
+  predict_df <- data.frame(actual = as.matrix(testing_y),
+                           predicted = pred)
+  colnames(predict_df) <- c("actual", "predicted")
+  
+  # Store resulting model, results, and included data
+  return(list(fit = fit,
+              results = c(spearman_rho = spearman_rho,
+                          spearman_p = spearman_p),
+              predictions = predict_df,
+              cell_lines = list(training_lines = modeling_data[["training_data"]]$cosmic_id,
+                                testing_lines = modeling_data[["testing_data"]]$cosmic_id)))
+}
+
+
+runPenLogReg <- function(modeling_data, signature_genes, alpha = c(0, 0.5, 1)){
+
+  # Format data
+  training_x <- modeling_data[["training_data"]] %>%
+    dplyr::select(all_of(signature_genes))
+  training_y <- modeling_data[["training_data"]] %>%
+    dplyr::select(IC50_high)
+
+  testing_x <- modeling_data[["testing_data"]] %>%
+    dplyr::select(all_of(signature_genes))
+  testing_y <- modeling_data[["testing_data"]] %>%
+    dplyr::select(IC50_high)
+
+  # Fit model
+  cv <- cv.glmnet(x = as.matrix(training_x), # determine optimal lambda with cv
+            y = as.matrix(training_y), 
+            alpha = alpha)
+  fit <- glmnet(x = as.matrix(training_x),
+                y = as.matrix(training_y), 
+                alpha = alpha,
+                lambda = cv$lambda.min, 
+                family = "binomial")
+  
+  # Perform prediction with testing data
+  prob <- predict(fit, newx = as.matrix(testing_x), 
+                  type = "response", type.measure = "class")
+
+  # Extract prediction probabilities for all testing samples
+  predict_df <- data.frame(predictions = prob, 
+                           labels = as.matrix(testing_y))
+  colnames(predict_df) <- c("predictions", "labels")
+
+  # Store resulting model, probabilities, and included data
+  return(list(fit = fit,
+              results = c(auc(roc(predict_df$labels, predict_df$predictions, quiet=TRUE))),
+              predictions = predict_df,
+              cell_lines = list(training_lines = modeling_data[["training_data"]]$cosmic_id,
+                                testing_lines = modeling_data[["testing_data"]]$cosmic_id)))
+}
+
+
+runSVM <- function(modeling_data, signature_genes,
+                   kernel = c("linear", "polynomial")){
+  
+  # Format data
+  training_data <- modeling_data[["training_data"]] %>%
+    dplyr::select(signature_genes, IC50_high)
+
+  testing_data <- modeling_data[["testing_data"]] %>%
+    dplyr::select(signature_genes, IC50_high)
+
+  # Fit model with training data 
+  # Using expression of each gene to predict IC50 as a binary variable
+  param <- tune.svm(IC50_high~., data = training_data, 
+                    degree = 3:5, gamma = 10^(-3:3), cost = 10^(-3:3))$best.parameters
+  fit <- svm(IC50_high ~ ., data = training_data, kernel = kernel,
+             gamma = param$gamma, cost = param$cost,
+             degree = param$degree, probability = TRUE)
+  
+  # Perform prediction with testing data
+  prob <- predict(fit, type="prob", probability = TRUE,
+                  newdata=testing_data[ , !(colnames(testing_data) %in% c("IC50_high"))])
+  
+  predict_df <- data.frame(predictions = prob,
+                           labels = testing_data$IC50_high)
+  
+  # Store resulting model, probabilities, and included data
+  return(list(fit = fit,
+              results = c(auc(roc(predict_df$labels, predict_df$predictions, quiet=TRUE))),
+              predictions = predict_df,
+              cell_lines = list(training_lines = modeling_data[["training_data"]]$cosmic_id,
+                                testing_lines = modeling_data[["testing_data"]]$cosmic_id)))
+}
+
+
+runRF <- function(modeling_data, signature_genes){
+  # Format Data 
+  training_data <- modeling_data[["training_data"]] %>%
+    dplyr::select(signature_genes, IC50_high)
+  colnames(training_data) <- c(paste0("gene", signature_genes), "IC50_high")
+  
+  testing_data <- modeling_data[["testing_data"]] %>%
+    dplyr::select(signature_genes, IC50_high)
+  colnames(testing_data) <- c(paste0("gene", signature_genes), "IC50_high")
+  
+  # Fit model with training data 
+  # Using expression of each gene to predict IC50 as a continuous variable
+  fit <- randomForest(factor(IC50_high)~., data = training_data, ntree=500)
+  
+  # Extract prediction probabilities for all testing samples
+  prob <- predict(fit,
+                  newdata=testing_data[ , !(colnames(testing_data) %in% c("IC50_high"))],
+                  type = "prob")
+  predict_df <- data.frame(predictions = prob[ , 1],
+                           labels = testing_data$IC50_high)
+  
+  # Store resulting model, probabilities, and included data
+  return(list(fit = fit,
+              results = c(auc(roc(predict_df$labels, predict_df$predictions, quiet=TRUE))),
+              predictions = predict_df,
+              cell_lines = list(training_lines = modeling_data[["training_data"]]$cosmic_id,
+                                testing_lines = modeling_data[["testing_data"]]$cosmic_id)))
+}
+
+
+```
+
+
+## Model Analysis
+
+```{r analyze_model_helpers}
+
+lmp <- function(modelobject) {
+  # This function takes a linear model and returns the p-value for its results 
+  # using the training dataset
+  if (class(modelobject) != "lm") stop("Not an object of class 'lm' ")
+  f <- summary(modelobject)$fstatistic
+  p <- pf(f[1],f[2],f[3],lower.tail=F)
+  attributes(p) <- NULL
+  return(p)
+}
+
+
+plot_ROC <- function(results_df, model_name, fold, group_name){
+  # Make this a ggplot object
+  # Code from https://rviews.rstudio.com/2019/03/01/some-r-packages-for-roc-curves/
+  roccurve <- roc(results_df$labels, results_df$predictions, smoothed = TRUE,
+                  # arguments for ci
+                  ci=FALSE, stratified=FALSE,
+                  # arguments for plot
+                  plot=TRUE, auc.polygon=FALSE, max.auc.polygon=FALSE, grid=FALSE,
+                  print.auc=TRUE, show.thres=TRUE)
+  # sens.ci <- ci.se(roccurve)
+  # plot(sens.ci, type="shape", col="lightblue", cex.axis = 2)
+  # plot(sens.ci, type="bars", cex.axis = 2)
+  roc_plot <- ggroc(roccurve, aes = c("linetype"), legacy.axes = TRUE) +
+    theme_bw() + 
+    geom_abline() + 
+    ggtitle(paste(model_name, "model\nFold", fold, "-", group_name)) + 
+    labs(x = "1 - Specificity", y = "Sensitivity") +
+    annotate("text", x = 0.75, y = 0.10, vjust = 0, size = 5,
+             label = paste("AUC =",sprintf("%.2f",roccurve$auc))) +
+    theme(axis.title = element_text(size = 20),
+          axis.text = element_text(size = 24),
+          plot.title = element_text(hjust = 0.5))
+  print(roc_plot)
+  return(roc_plot)
+}
+
+
+plot_regr <- function(results_df, model_name, fold, group_name){
+  plot_var <- (ggplot(results_df, aes(x = actual, y = predicted)) +
+    geom_point(size=5, alpha = 0.5, color = "black") + 
+      stat_cor(aes(label = ..r.label..), 
+               method = "spearman", cor.coef.name = "rho", 
+               label.x = 5.5, label.y.npc = "bottom", size = 4) +
+    geom_smooth(formula = y ~ x, method='lm', color = "red") + 
+    labs(x = "Actual IC50", y = "Predicted IC50") + 
+    coord_cartesian(clip = 'off') +
+    ggtitle(paste(model_name, "model\nFold", fold, "-", group_name)) +
+      theme_bw() + 
+    theme(axis.title = element_text(size = 20),
+      axis.text = element_text(size = 24),
+      plot.title = element_text(hjust = 0.5)))
+  print(plot_var)
+  return(plot_var)
+}
+
+
+
+```
+
+
+
+## Run all
+
+```{r run_pred}
+
+run_pred_stats <- function(tidy_data, signature_genes, rm_extremes = FALSE,
+                           test_train_seed = NA, group = "", score_perc, 
+                           run_plots = FALSE, nfolds){
+  # This function will run all prediction models, plot results, and return results
+  print("running sig stats")
+  # for plotting/saving
+  if(score_perc == 0.5){group="Halves"}
+  if(score_perc==0.2){group="Quintiles"}
+  
+  complete_data <- format_model_data(tidy_data, signature_genes, score_perc)
+  testing_lines <- create_test_groups(complete_data, 5, seed = test_train_seed)
+  
+  linReg_results <- list()
+  logReg_results <- list()
+  linRegENet_results <- list()
+  linRegL1_results <- list()
+  linRegL2_results <- list()
+  logRegENet_results <- list()
+  logRegL1_results <- list()
+  logRegL2_results <- list()
+  SVMlinear_results <- list()
+  SVMpoly_results <- list()
+  rf_results <- list()
+  
+  for(i in 1:length(testing_lines)){
+      training_data <- complete_data %>%
+        filter(!(cosmic_id %in% testing_lines[[i]]))
+      testing_data <- complete_data %>%
+        filter(cosmic_id %in% testing_lines[[i]])
+      modeling_data <- list(training_data = training_data, 
+                            testing_data = testing_data)
+
+    # Simple linear regression using signature score to predict continuous IC50
+      linReg_results[[i]] <- runLinReg(modeling_data)
+
+    if(run_plots==TRUE){
+      png(filename = here("Results", drug, "Plots", "Linear_Models", 
+                        paste0("linReg_",
+                               "deCompPerc", (de_comp_perc*100),
+                               "_rmExtremePerc", rm_extreme_perc*100,
+                               "_samPerm", sam_perm,
+                               "_multPerm", mult_perm,
+                               "_nFolds", n_folds, 
+                               "_", group, "_CVfold", i, ".png")))
+      linReg_results[[i]][["plots"]] <- plot_regr(linReg_results[[i]]$predictions, 
+                                                  "Simple Lin Regr", i, group)
+      print(linReg_results[[i]][["plots"]])
+      dev.off()
+    }
+
+    # Simple logistic regression using signature score to predict binary IC50
+    logReg_results[[i]] <- runLogReg(modeling_data)
+
+    if(run_plots==TRUE){
+      png(filename = here("Results", drug, "Plots", "ROC_Curves", 
+                        paste0("logReg_",
+                               "deCompPerc", (de_comp_perc*100),
+                               "_rmExtremePerc", rm_extreme_perc*100,
+                               "_samPerm", sam_perm,
+                               "_multPerm", mult_perm,
+                               "_nFolds", n_folds,
+                               "_", group, "_CVfold", i,  ".png")))
+      logReg_results[[i]][["plots"]] <-plot_ROC(logReg_results[[i]]$predictions, 
+                                                "Simple Log Regr", i, group)
+      print(logReg_results[[i]][["plots"]])
+      dev.off()
+    }
+
+    # Penalized linear regression using expression of each gene to predict continuous IC50 with elastic net penalization
+    linRegENet_results[[i]] <- runPenLinReg(modeling_data,
+                                       signature_genes = signature_genes,
+                                       alpha = 0.5)
+
+    if(run_plots==TRUE){
+      png(filename = here("Results", drug, "Plots", "Linear_Models", 
+                        paste0("linRegENet_",
+                               "deCompPerc", (de_comp_perc*100),
+                               "_rmExtremePerc", rm_extreme_perc*100,
+                               "_samPerm", sam_perm,
+                               "_multPerm", mult_perm,
+                               "_nFolds", n_folds,
+                               "_", group, "_CVfold", i,  ".png")))
+      linRegENet_results[[i]][["plots"]] <- plot_regr(linRegENet_results[[i]]$predictions, 
+                                                      "Elastic Net Lin Regr", i, group)
+      print(linRegENet_results[[i]][["plots"]])
+      dev.off()
+    }
+    
+    # Penalized linear regression using expression of each gene to predict continuous IC50 with L1 penalization
+    linRegL1_results[[i]] <- runPenLinReg(modeling_data,
+                                          signature_genes = signature_genes,
+                                          alpha = 1)
+
+    if(run_plots==TRUE){
+      png(filename = here("Results", drug, "Plots", "Linear_Models", 
+                        paste0("linRegL1_",
+                               "deCompPerc", (de_comp_perc*100),
+                               "_rmExtremePerc", rm_extreme_perc*100,
+                               "_samPerm", sam_perm,
+                               "_multPerm", mult_perm,
+                               "_nFolds", n_folds, 
+                               "_", group, "_CVfold", i, ".png")))
+      linRegL1_results[[i]][["plots"]] <- plot_regr(linRegL1_results[[i]]$predictions, 
+                                                    "L1 Lin Regr", i, group)
+      print(linRegL1_results[[i]][["plots"]])
+      dev.off()
+    }
+
+    # Penalized linear regression using expression of each gene to predict continuous IC50 with L2 penalization
+    linRegL2_results[[i]] <- runPenLinReg(modeling_data,
+                                          signature_genes = signature_genes,
+                                          alpha = 0)
+
+    if(run_plots==TRUE){
+      png(filename = here("Results", drug, "Plots", "Linear_Models", 
+                        paste0("linRegL2_",
+                               "deCompPerc", (de_comp_perc*100),
+                               "_rmExtremePerc", rm_extreme_perc*100,
+                               "_samPerm", sam_perm,
+                               "_multPerm", mult_perm,
+                               "_nFolds", n_folds, 
+                               "_", group, "_CVfold", i, ".png")))
+      linRegL2_results[[i]][["plots"]] <- plot_regr(linRegL2_results[[i]]$predictions, 
+                                                    "L2 Lin Regr", i, group)
+      print(linRegL2_results[[i]][["plots"]])
+      dev.off()
+    }
+
+    # Penalized logistic regression using expression of each gene to predict binary IC50 with elastic net penalization
+    logRegENet_results[[i]] <- runPenLogReg(modeling_data,
+                                            signature_genes = signature_genes,
+                                            alpha = 0.5)
+
+    if(run_plots==TRUE){
+      png(filename = here("Results", drug, "Plots", "ROC_Curves", 
+                        paste0("logRegENet_",
+                               "deCompPerc", (de_comp_perc*100),
+                               "_rmExtremePerc", rm_extreme_perc*100,
+                               "_samPerm", sam_perm,
+                               "_multPerm", mult_perm,
+                               "_nFolds", n_folds, 
+                               "_", group, "_CVfold", i, ".png")))
+      logRegENet_results[[i]][["plots"]] <- plot_ROC(logRegENet_results[[i]]$predictions, 
+                                                     "Elastic Net Log Regr", i, group)
+      print(logRegENet_results[[i]][["plots"]])
+      dev.off()
+    }
+
+    # Penalized logistic regression using expression of each gene to predict binary IC50 with elastic net penalization
+    logRegL1_results[[i]] <- runPenLogReg(modeling_data,
+                                          signature_genes = signature_genes,
+                                          alpha = 1)
+
+    if(run_plots==TRUE){
+      png(filename = here("Results", drug, "Plots", "ROC_Curves", 
+                        paste0("logRegL1_", 
+                               "deCompPerc", (de_comp_perc*100),
+                               "_rmExtremePerc", rm_extreme_perc*100,
+                               "_samPerm", sam_perm,
+                               "_multPerm", mult_perm,
+                               "_nFolds", n_folds, 
+                               "_", group, "_CVfold", i, ".png")))
+      logRegL1_results[[i]][["plots"]] <- plot_ROC(logRegL1_results[[i]]$predictions, "L1 Log Regr", i, group)
+      print(logRegL1_results[[i]][["plots"]])
+      dev.off()
+    }
+
+    # Penalized logistic regression using expression of each gene to predict binary IC50 with elastic net penalization
+    logRegL2_results[[i]] <- runPenLogReg(modeling_data,
+                                          signature_genes = signature_genes,
+                                          alpha = 0)
+
+    if(run_plots==TRUE){
+      png(filename = here("Results", drug, "Plots", "ROC_Curves", 
+                        paste0("logRegL2_", 
+                               "deCompPerc", (de_comp_perc*100),
+                               "_rmExtremePerc", rm_extreme_perc*100,
+                               "_samPerm", sam_perm,
+                               "_multPerm", mult_perm,
+                               "_nFolds", n_folds, 
+                               "_", group, "_CVfold", i, ".png")))
+      logRegL2_results[[i]][["plots"]] <- plot_ROC(logRegL2_results[[i]]$predictions, "L2 Log Regr", i, group)
+      print(logRegL2_results[[i]][["plots"]])
+      dev.off()
+    }
+
+    # SVM (linear kernel) using expression of each gene to predict IC50 class
+    SVMlinear_results[[i]] <- runSVM(modeling_data,
+                                signature_genes = signature_genes,
+                                kernel = "linear")
+
+
+    if(run_plots==TRUE){
+      png(filename = here("Results", drug, "Plots", "ROC_Curves", 
+                        paste0("SVMlinear_",
+                               "deCompPerc", (de_comp_perc*100),
+                               "_rmExtremePerc", rm_extreme_perc*100,
+                               "_samPerm", sam_perm,
+                               "_multPerm", mult_perm,
+                               "_nFolds", n_folds, 
+                               "_", group, "_CVfold", i, ".png")))
+      SVMlinear_results[[i]][["plots"]] <-plot_ROC(SVMlinear_results[[i]]$predictions, "SVM (linear kernel)", i, group)
+      print(SVMlinear_results[[i]][["plots"]])
+      dev.off()
+    }
+
+    # SVM (polynomial kernel) using expression of each gene to predict IC50 class
+    SVMpoly_results[[i]] <- runSVM(modeling_data,
+                                signature_genes = signature_genes,
+                                kernel = "polynomial")
+
+    if(run_plots==TRUE){
+      png(filename = here("Results", drug, "Plots", "ROC_Curves", 
+                        paste0("SVMpoly_",
+                               "deCompPerc", (de_comp_perc*100),
+                               "_rmExtremePerc", rm_extreme_perc*100,
+                               "_samPerm", sam_perm,
+                               "_multPerm", mult_perm,
+                               "_nFolds", n_folds, 
+                               "_", group, "_CVfold", i, ".png")))
+      SVMpoly_results[[i]][["plots"]] <-plot_ROC(SVMpoly_results[[i]]$predictions, "SVM (poly kernel)", i, group)
+      print(SVMpoly_results[[i]][["plots"]])
+      dev.off()
+    }
+
+    # RF using expression of each gene to predict IC50 class
+    rf_results[[i]] <- runRF(modeling_data, signature_genes = signature_genes)
+
+    if(run_plots==TRUE){
+      png(filename = here("Results", drug, "Plots", "ROC_Curves", 
+                        paste0("rf_", 
+                               "deCompPerc", (de_comp_perc*100),
+                               "_rmExtremePerc", rm_extreme_perc*100,
+                               "_samPerm", sam_perm,
+                               "_multPerm", mult_perm,
+                               "_nFolds", n_folds, 
+                               "_", group, "_CVfold", i, ".png")))
+      rf_results[[i]][["plots"]] <-plot_ROC(rf_results[[i]]$predictions, "Random Forest", i, group)
+      print(rf_results[[i]][["plots"]])
+      dev.off()
+    }
+  }   
+  return(list(linReg = linReg_results,
+              logReg = logReg_results,
+              linRegENet = linRegENet_results,
+              linRegL1 = linRegL1_results,
+              linRegL2 = linRegL2_results,
+              logRegENet = logRegENet_results,
+              logRegL1 = logRegL1_results,
+              logRegL2 = logRegL2_results,
+              SVMlinear = SVMlinear_results,
+              SVMpoly = SVMpoly_results,
+              rf = rf_results))
+}
+
+
+```
+
+
+Let's run the models on our signature first. 
+
+
+If we're running this locally (not on the cluster), we'll run the plots. We'll first set the `run_plots` param to `FALSE` here, then we'll use a code chunk that doesn't get converted to the R script (because the `purl` parameter is set to `FALSE`) to se it to `TRUE`.
+
+```{r plot_param_false}
+
+run_plots = FALSE
+
+```
+
+```{r plot_param_true, purl=FALSE}
+
+run_plots = TRUE
+
+```
+
+```{r run_sig_models, message=FALSE, warning=FALSE, purl=FALSE}
+
+# Run the prediction algorithms on the actual cisplatin signature
+
+pred_halves_sig <- run_pred_stats(tidy_data = tidy_gdsc,
+                                  signature_genes=signature,
+                                  test_train_seed = 1973,
+                                  score_perc = 0.5,
+                                  rm_extremes = FALSE,
+                                  run_plots = run_plots)
+
+saveRDS(pred_halves_sig, 
+        file = here("Results", drug, "Prediction_Modeling",
+                    paste0("pred_halves_sig_results_",
+                           "deCompPerc", (de_comp_perc*100),
+                           "_rmExtremePerc", rm_extreme_perc*100,
+                           "_samPerm", sam_perm,
+                           "_multPerm", mult_perm,
+                           "_nFolds", n_folds, ".rds")))
+
+pred_quintiles_sig <- run_pred_stats(tidy_data = tidy_gdsc,
+                                  signature_genes=signature,
+                                  test_train_seed = 1973,
+                                  score_perc = 0.2,
+                                  rm_extremes = FALSE,
+                                  run_plots = run_plots)
+
+saveRDS(pred_quintiles_sig,
+        file = here("Results", drug, "Prediction_Modeling",
+                    paste0("pred_quintiles_sig_results_",
+                           "deCompPerc", (de_comp_perc*100),
+                           "_rmExtremePerc", rm_extreme_perc*100,
+                           "_samPerm", sam_perm,
+                           "_multPerm", mult_perm,
+                           "_nFolds", n_folds, ".rds")))
+
+
+```
+
+
+Next, we'll make a function to extract a performance metric for each model built by each of the replicates. Since there are multiple folds per replicate, we extract the best performing metric for each replicate (the best fold), because this is what would be done in the instance of a test result.
+
+```{r extract_metrics}
+
+
+extract_model_metric <- function(results, 
+                                 model_name = c("linReg", "linRegENet", 
+                                                "linRegL1", "linRegL2", 
+                                                "logReg", "logRegENet", 
+                                                "logRegL1", "logRegL2", 
+                                                "SVMlinear", "SVMpoly", 
+                                                "rf")){
+  
+  # --------------------------------------------------------------
+  # Given the results from the `run_pred_stats` function, this will loop through 
+  # each replicate (bootstrap), extract the summary metric (either spearman 
+  # correlation rho or AUC) for each fold, then store the best metric between 
+  # each fold for each replicate. 
+  # Note: if trying to extract the results from a SINGLE run of the 
+  # `run_pred_stats`, instead of a run using lapply testing multiple replicates, 
+  # the single result must be put into another list (in order to work with the 
+  # first loop (running through i))
+  # --------------------------------------------------------------
+  # Input: a compiled list of results from `run_pred_stats` 
+  # Returns: vector (or individual value) of the best metric for each replicate
+  # --------------------------------------------------------------
+  best_metrics <- c()
+  for (i in 1:length(results)){ # loop each replicate
+    rep_metrics <- c()
+    for (j in 1:length(results[[i]][[model_name]])){ # for each fold within each replicate
+      fold_results <- results[[i]][[model_name]][[j]][[2]] # extract results from j fold of i replicate
+      if (model_name %in% c("linReg", "linRegENet", "linRegL1", "linRegL2")){
+        fold_metric <- fold_results[["spearman_rho.rho"]] # spearman correlation rho
+      }
+      if (model_name %in% c("logReg", "logRegENet", "logRegL1", "logRegL2", "SVMlinear", "SVMpoly", "rf")){
+        fold_metric <- fold_results # auc 
+      }
+      rep_metrics <- c(fold_metric, rep_metrics)
+    }
+    best_metrics <- c(best_metrics, max(rep_metrics, na.rm = TRUE))
+  }
+  return(best_metrics)
+}
+
+
+```
+
+
+We'll extract performance metrics from modeling work using our signature. 
+
+```{r sig_metrics, purl=FALSE}
+
+
+# Extract actual results
+metrics_halves_sig <- readRDS(file = here("Results", drug, "Prediction_Modeling",
+                                          paste0("pred_halves_sig_results_",
+                                                 "deCompPerc", (de_comp_perc*100),
+                                                 "_rmExtremePerc", rm_extreme_perc*100,
+                                                 "_samPerm", sam_perm,
+                                                 "_multPerm", mult_perm,
+                                                 "_nFolds", n_folds, ".rds")))  # if you're reading it in
+# metrics_halves_sig <- pred_halves_sig # if you created it in this current environment
+
+metric_halves_linReg_sig <- extract_model_metric(list(metrics_halves_sig), "linReg")
+metric_halves_linRegENet_sig <- extract_model_metric(list(metrics_halves_sig), "linRegENet")
+metric_halves_linRegL1_sig <- extract_model_metric(list(metrics_halves_sig), "linRegL1")
+metric_halves_linRegL2_sig <- extract_model_metric(list(metrics_halves_sig), "linRegL2")
+metric_halves_logReg_sig <- extract_model_metric(list(metrics_halves_sig), "logReg")
+metric_halves_logRegENet_sig <- extract_model_metric(list(metrics_halves_sig), "logRegENet")
+metric_halves_logRegL1_sig <- extract_model_metric(list(metrics_halves_sig), "logRegL1")
+metric_halves_logRegL2_sig <- extract_model_metric(list(metrics_halves_sig), "logRegL2")
+metric_halves_SVMlinear_sig <- extract_model_metric(list(metrics_halves_sig), "SVMlinear")
+metric_halves_SVMpoly_sig <- extract_model_metric(list(metrics_halves_sig), "SVMpoly")
+metric_halves_rf_sig <- extract_model_metric(list(metrics_halves_sig), "rf")
+metric_halves_all <- c(metric_halves_linReg_sig, metric_halves_linRegENet_sig, 
+                       metric_halves_linRegL1_sig, metric_halves_linRegL2_sig,
+                       metric_halves_logReg_sig, metric_halves_logRegENet_sig,
+                       metric_halves_logRegL1_sig, metric_halves_logRegL2_sig,
+                       metric_halves_SVMlinear_sig, metric_halves_SVMpoly_sig,
+                       metric_halves_rf_sig)
+
+metrics_quintiles_sig <- readRDS(file = here("Results", drug, "Prediction_Modeling",
+                                          paste0("pred_quintiles_sig_results_",
+                                                 "deCompPerc", (de_comp_perc*100),
+                                                 "_rmExtremePerc", rm_extreme_perc*100,
+                                                 "_samPerm", sam_perm,
+                                                 "_multPerm", mult_perm,
+                                                 "_nFolds", n_folds, ".rds"))) # if you're reading it in
+# metrics_quintiles_sig <- pred_quintiles_sig # if you created it in this current environment
+
+
+metric_quintiles_linReg_sig <- extract_model_metric(list(metrics_quintiles_sig), "linReg")
+metric_quintiles_linRegENet_sig <- extract_model_metric(list(metrics_quintiles_sig), "linRegENet")
+metric_quintiles_linRegL1_sig <- extract_model_metric(list(metrics_quintiles_sig), "linRegL1")
+metric_quintiles_linRegL2_sig <- extract_model_metric(list(metrics_quintiles_sig), "linRegL2")
+metric_quintiles_logReg_sig <- extract_model_metric(list(metrics_quintiles_sig), "logReg")
+metric_quintiles_logRegENet_sig <- extract_model_metric(list(metrics_quintiles_sig), "logRegENet")
+metric_quintiles_logRegL1_sig <- extract_model_metric(list(metrics_quintiles_sig), "logRegL1")
+metric_quintiles_logRegL2_sig <- extract_model_metric(list(metrics_quintiles_sig), "logRegL2")
+metric_quintiles_SVMlinear_sig <- extract_model_metric(list(metrics_quintiles_sig), "SVMlinear")
+metric_quintiles_SVMpoly_sig <- extract_model_metric(list(metrics_quintiles_sig), "SVMpoly")
+metric_quintiles_rf_sig <- extract_model_metric(list(metrics_quintiles_sig), "rf")
+metric_quintiles_all <- c(metric_quintiles_linReg_sig, metric_quintiles_linRegENet_sig, 
+                       metric_quintiles_linRegL1_sig, metric_quintiles_linRegL2_sig,
+                       metric_quintiles_logReg_sig, metric_quintiles_logRegENet_sig,
+                       metric_quintiles_logRegL1_sig, metric_quintiles_logRegL2_sig,
+                       metric_quintiles_SVMlinear_sig, metric_quintiles_SVMpoly_sig,
+                       metric_quintiles_rf_sig)
+
+metric_sig_all <- rbind(metric_halves_all, metric_quintiles_all)
+colnames(metric_sig_all) <- c("linReg", "linRegENet", "linRegL1", "linRegL2",
+                              "logReg", "logRegENet", "logRegL1", "logRegL2",
+                              "SVMlinear", "SVMpoly", "rf")
+
+```
+
+
+# Build Null Distributions
+
+And finally, let's run these stats on the random signatures. First, we'll set `n`, the number of bootstraps to test. In the manuscript this is 1000. Running this on a personal machine will require very significant RAM. Most likely, this will need to be performed on an HPC. Changing `n` to a much smaller number (~3) will allow a user to see the functionality without taking more than half an hour total for testing quintiles and complete data. 
+
+```{r null_stats}
+
+null_sigs <- list()
+i <- 1
+
+for (seed in 2021:(2021+(n-1))) { # run this n times, with a random seed
+  set.seed(seed)
+  random_sig <- sample(colnames(tidy_gdsc)[5:(length(colnames(tidy_gdsc)))], 
+                       size = length(signature), 
+                       replace = FALSE, 
+                       prob = NULL)
+  null_sigs[[i]] = random_sig
+  i <- i + 1
+}
+
+null_sig_mat <- matrix(unlist(null_sigs), ncol = n)
+
+# saveRDS(null_sig_mat, here("Results", drug, "Prediction_Modeling",
+#                            paste0("null_sigs_mat_",
+#                                   "deCompPerc", (de_comp_perc*100),
+#                                   "_rmExtremePerc", rm_extreme_perc*100,
+#                                   "_samPerm", sam_perm,
+#                                   "_multPerm", mult_perm,
+#                                   "_nFolds", n_folds, ".rds")))
+
+saveRDS(null_sig_mat, file = paste0("~/working-cissig/Results/",
+                                    drug,
+                                    "/Null_Models/",
+                                    "null_sigs_mat_",
+                                    "boot", n,
+                                    "_deCompPerc", (de_comp_perc*100),
+                                    "_rmExtremePerc", rm_extreme_perc*100,
+                                    "_samPerm", sam_perm,
+                                    "_multPerm", mult_perm,
+                                    "_nFolds", n_folds, ".rds"))
+
+```
+
+
+First, we'll run it on the complete dataset (comparing top and bottom halves). The seed is still set to 0, which goes to the test/training group split. This will remain commented out, because it takes  too long to run on a local machine. Instead, we'll load the processed (best metric per signature extracted) results further down.
+
+**This code will be commented out until it is used in the cluster.**
+
+```{r run_null_halves, message=FALSE}
+
+if (args[1] == "h") {
+  
+  pred_halves_null <- lapply(null_sigs, FUN = function(genes)
+    run_pred_stats(tidy_data = tidy_gdsc,
+                   signature_genes=genes,
+                   test_train_seed = 1973,
+                   score_perc = 0.5,
+                   rm_extremes = FALSE,
+                   run_plots = run_plots))
+
+  # Save raw results
+  names(pred_halves_null) <- 1:n
+  # saveRDS(pred_halves_null,
+          # file = "~/working-cissig/Results/Null_Models/modeling_halves_null.RDS")
+  # pred_halves_null <- readRDS("~/working-cissig/Results/Null_Models/modeling_halves_null.RDS")
+
+  # Save extracted best metrics (out of the 5 folds) for each of the `n` runs
+  metrics_linReg_halves_null <- extract_model_metric(pred_halves_null, "linReg")
+  metrics_linRegENet_halves_null <- extract_model_metric(pred_halves_null, "linRegENet")
+  metrics_linRegL1_halves_null <- extract_model_metric(pred_halves_null, "linRegL1")
+  metrics_linRegL2_halves_null <- extract_model_metric(pred_halves_null, "linRegL2")
+  metrics_logReg_halves_null <- extract_model_metric(pred_halves_null, "logReg")
+  metrics_logRegENet_halves_null <- extract_model_metric(pred_halves_null, "logRegENet")
+  metrics_logRegL1_halves_null <- extract_model_metric(pred_halves_null, "logRegL1")
+  metrics_logRegL2_halves_null <- extract_model_metric(pred_halves_null, "logRegL2")
+  metrics_SVMlinear_halves_null <- extract_model_metric(pred_halves_null, "SVMlinear")
+  metrics_SVMpoly_halves_null <- extract_model_metric(pred_halves_null, "SVMpoly")
+  metrics_rf_halves_null <- extract_model_metric(pred_halves_null, "rf")
+
+  names(metrics_linReg_halves_null) <- seq(1, length(metrics_linReg_halves_null))
+  names(metrics_linRegENet_halves_null) <- seq(1, length(metrics_linRegENet_halves_null))
+  names(metrics_linRegL1_halves_null) <- seq(1, length(metrics_linRegL1_halves_null))
+  names(metrics_linRegL2_halves_null) <- seq(1, length(metrics_linRegL2_halves_null))
+  names(metrics_logReg_halves_null) <- seq(1, length(metrics_logReg_halves_null))
+  names(metrics_logRegENet_halves_null) <- seq(1, length(metrics_logRegENet_halves_null))
+  names(metrics_logRegL1_halves_null) <- seq(1, length(metrics_logRegL1_halves_null))
+  names(metrics_logRegL2_halves_null) <- seq(1, length(metrics_logRegL2_halves_null))
+  names(metrics_SVMlinear_halves_null) <- seq(1, length(metrics_SVMlinear_halves_null))
+  names(metrics_SVMpoly_halves_null) <- seq(1, length(metrics_SVMpoly_halves_null))
+  names(metrics_rf_halves_null) <- seq(1, length(metrics_rf_halves_null))
+
+  metrics_halves_null <- data.frame(metrics_linReg_halves_null,
+                                    metrics_linRegENet_halves_null,
+                                    metrics_linRegL1_halves_null,
+                                    metrics_linRegL2_halves_null,
+                                    metrics_logReg_halves_null,
+                                    metrics_logRegENet_halves_null,
+                                    metrics_logRegL1_halves_null,
+                                    metrics_logRegL2_halves_null,
+                                    metrics_SVMlinear_halves_null,
+                                    metrics_SVMpoly_halves_null,
+                                    metrics_rf_halves_null)
+
+  colnames(metrics_halves_null) <- c("linReg",
+                                     "linRegENet", "linRegL1", "linRegL2",
+                                     "logReg",
+                                     "logRegENet", "logRegL1", "logRegL2",
+                                     "SVMlinear", "SVMpoly", "rf")
+
+  # Save extracted results
+  write.csv(metrics_halves_null, quote = FALSE,
+            file = paste0("~/working-cissig/Results/", drug,
+                          "/Null_Models/",
+                          "metrics_halves_null_",
+                          "boot", n,
+                          "_deCompPerc", (de_comp_perc*100),
+                          "_rmExtremePerc", rm_extreme_perc*100,
+                          "_samPerm", sam_perm,
+                          "_multPerm", mult_perm,
+                          "_nFolds", n_folds, ".csv"))
+}
+
+```
+
+
+Then, we'll run on the most extreme data, containing only samples with the top/bottom quintiles of expression score. 
+
+**This code will be commented out until it is used in the cluster.**
+
+
+```{r run_null_quintiles, message=FALSE}
+
+if (args[1] == "q") {
+
+  pred_quintiles_null <- lapply(null_sigs, FUN = function(genes)
+    run_pred_stats(tidy_data = tidy_gdsc,
+                   signature_genes=genes,
+                   test_train_seed = 1973,
+                   score_perc = 0.2,
+                   rm_extremes = FALSE,
+                   run_plots = run_plots))
+
+  # Save raw results
+  names(pred_quintiles_null) <- 1:n
+  # saveRDS(pred_quintiles_null,
+          # file = "~/working-cissig/Results/Null_Models/modeling_quintiles_null.RDS")
+  # pred_quintiles_null <- readRDS("~/working-cissig/Results/Null_Models/modeling_quintiles_null.RDS")
+
+  # Save extracted best metrics (out of the 5 folds) for each of the `n` runs
+  metrics_linReg_quintiles_null <- extract_model_metric(pred_quintiles_null, "linReg")
+  metrics_linRegENet_quintiles_null <- extract_model_metric(pred_quintiles_null, "linRegENet")
+  metrics_linRegL1_quintiles_null <- extract_model_metric(pred_quintiles_null, "linRegL1")
+  metrics_linRegL2_quintiles_null <- extract_model_metric(pred_quintiles_null, "linRegL2")
+  metrics_logReg_quintiles_null <- extract_model_metric(pred_quintiles_null, "logReg")
+  metrics_logRegENet_quintiles_null <- extract_model_metric(pred_quintiles_null, "logRegENet")
+  metrics_logRegL1_quintiles_null <- extract_model_metric(pred_quintiles_null, "logRegL1")
+  metrics_logRegL2_quintiles_null <- extract_model_metric(pred_quintiles_null, "logRegL2")
+  metrics_SVMlinear_quintiles_null <- extract_model_metric(pred_quintiles_null, "SVMlinear")
+  metrics_SVMpoly_quintiles_null <- extract_model_metric(pred_quintiles_null, "SVMpoly")
+  metrics_rf_quintiles_null <- extract_model_metric(pred_quintiles_null, "rf")
+
+  names(metrics_linReg_quintiles_null) <- seq(1, length(metrics_linReg_quintiles_null))
+  names(metrics_linRegENet_quintiles_null) <- seq(1, length(metrics_linRegENet_quintiles_null))
+  names(metrics_linRegL1_quintiles_null) <- seq(1, length(metrics_linRegL1_quintiles_null))
+  names(metrics_linRegL2_quintiles_null) <- seq(1, length(metrics_linRegL2_quintiles_null))
+  names(metrics_logReg_quintiles_null) <- seq(1, length(metrics_logReg_quintiles_null))
+  names(metrics_logRegENet_quintiles_null) <- seq(1, length(metrics_logRegENet_quintiles_null))
+  names(metrics_logRegL1_quintiles_null) <- seq(1, length(metrics_logRegL1_quintiles_null))
+  names(metrics_logRegL2_quintiles_null) <- seq(1, length(metrics_logRegL2_quintiles_null))
+  names(metrics_SVMlinear_quintiles_null) <- seq(1, length(metrics_SVMlinear_quintiles_null))
+  names(metrics_SVMpoly_quintiles_null) <- seq(1, length(metrics_SVMpoly_quintiles_null))
+  names(metrics_rf_quintiles_null) <- seq(1, length(metrics_rf_quintiles_null))
+
+  metrics_quintiles_null <- data.frame(metrics_linReg_quintiles_null,
+                                    metrics_linRegENet_quintiles_null,
+                                    metrics_linRegL1_quintiles_null,
+                                    metrics_linRegL2_quintiles_null,
+                                    metrics_logReg_quintiles_null,
+                                    metrics_logRegENet_quintiles_null,
+                                    metrics_logRegL1_quintiles_null,
+                                    metrics_logRegL2_quintiles_null,
+                                    metrics_SVMlinear_quintiles_null,
+                                    metrics_SVMpoly_quintiles_null,
+                                    metrics_rf_quintiles_null)
+
+  colnames(metrics_quintiles_null) <- c("linReg",
+                                     "linRegENet", "linRegL1", "linRegL2",
+                                     "logReg",
+                                     "logRegENet", "logRegL1", "logRegL2",
+                                     "SVMlinear", "SVMpoly", "rf")
+
+  # Save extracted results
+  write.csv(metrics_quintiles_null, quote = FALSE,
+            file = paste0("~/working-cissig/Results/", drug,
+                          "/Null_Models/",
+                          "metrics_quintiles_null_",
+                          "boot", n,
+                          "_deCompPerc", (de_comp_perc*100),
+                          "_rmExtremePerc", rm_extreme_perc*100,
+                          "_samPerm", sam_perm,
+                          "_multPerm", mult_perm,
+                          "_nFolds", n_folds, ".csv"))
+}
+
+```
+
+
+# Plot Null Distributions
+
+Now, let's get all the results together in different variables for each model type and data source (either complete (`d="h"`) or only top/bottom quintiles (`d="q"`)).
+
+
+``` {r organize_results, message=FALSE, purl=FALSE}
+
+# metrics_halves_null <- read.csv("../Results/Prediction_Modeling/metrics_halves_null1000_norm.csv")
+
+metrics_halves_null <- read.csv(here("Results", drug, "Null_Models", 
+                          paste0("metrics_halves_null_",
+                                 "boot", n,
+                                 "_deCompPerc", (de_comp_perc*100),
+                                 "_rmExtremePerc", rm_extreme_perc*100,
+                                 "_samPerm", sam_perm,
+                                 "_multPerm", mult_perm,
+                                 "_nFolds", n_folds, ".csv")))
+
+metrics_quintiles_null <- read.csv(here("Results", drug, "Null_Models", 
+                          paste0("metrics_quintiles_null_",
+                                 "boot", n,
+                                 "_deCompPerc", (de_comp_perc*100),
+                                 "_rmExtremePerc", rm_extreme_perc*100,
+                                 "_samPerm", sam_perm,
+                                 "_multPerm", mult_perm,
+                                 "_nFolds", n_folds, ".csv")))
+
+
+```
+
+
+And finally, let's plot the null distribution and where our results lie in it! We'll use `ggplot` to plot a histogram of each type of model (e.g. `Linear regression`, `SVM`, etc.). We'll add in red, dashed lines to demonstrate where 95% of the null distribution lies along with a red, solid line to denote the median of the null distribution. Finally, a blue, solid line will represent the Cisplatin Sensitivity Signature result. 
+
+```{r plot_null_dist, message=FALSE, purl=FALSE}
+
+
+plot_null_results <- function(metrics_null, metrics_test, 
+                              model_name, metric_name, group_name){
+  null <- data.frame(metric = metrics_null)
+  plot_name <- here("Results", drug, "Plots", "Null_Model_Metrics",
+                    paste0("nulldistribution_", 
+                      model_name, "_", group_name, "_",
+                      "boot", n,
+                      "deCompPerc", (de_comp_perc*100),
+                      "_rmExtremePerc", rm_extreme_perc*100,
+                      "_samPerm", sam_perm,
+                      "_multPerm", mult_perm,
+                      "_nFolds", n_folds, ".png"))
+  png(filename = plot_name, width = 1800, height = 1500, res = 250)
+  null_plot <- (ggplot(null, aes(x = metric)) + 
+          geom_histogram(bins = 20, fill = "#e1d5c9", color = "black") + 
+          geom_vline(xintercept = metrics_test, colour = "red", size = 1.5) +
+          geom_vline(xintercept = quantile(metrics_null, 0.95),
+                     linetype = "dashed", colour = "seashell4", size = 1.5) +
+          geom_vline(xintercept = quantile(metrics_null, 0.5), colour = "seashell4", size = 1.5) +
+          # geom_vline(xintercept = quantile(metrics_null, 0.025),
+          # linetype = "dashed", colour = "seashell3", size = 1.5) +
+          ggtitle(label = paste(model_name, "Model \n", group_name)) + 
+          labs(x = metric_name, y = "Count") + 
+          coord_cartesian(clip = 'off') +
+          theme_bw() + 
+          theme(plot.title = element_text(hjust = 0.5),
+                plot.subtitle = element_text(hjust = 0.5),
+                axis.text = element_text(size = 25),
+                plot.margin = unit(c(1,1,1,1), "cm"))
+    )
+  print(null_plot)
+  dev.off()
+  return(null_plot)
+}
+
+
+linReg_halves_null_plot <- plot_null_results(metrics_null = metrics_halves_null$linReg,
+                  metrics_test = metric_halves_linReg_sig,
+                  model_name = "Linear Reg.", 
+                  metric_name = "Spearman's Rho",
+                  group_name = "Halves")
+linRegL1_halves_null_plot <- plot_null_results(metrics_null = metrics_halves_null$linRegL1,
+                  metrics_test = metric_halves_linRegL1_sig,
+                  model_name = "L1 Penalized Linear Reg.", 
+                  metric_name = "Spearman's Rho",
+                  group_name = "Halves")
+linRegL2_halves_null_plot <- plot_null_results(metrics_null = metrics_halves_null$linRegL2,
+                  metrics_test = metric_halves_linRegL2_sig,
+                  model_name = "L2 Penalized Linear Reg.", 
+                  metric_name = "Spearman's Rho",
+                  group_name = "Halves")
+linRegENet_halves_null_plot <- plot_null_results(metrics_null = metrics_halves_null$linRegENet,
+                  metrics_test = metric_halves_linRegENet_sig,
+                  model_name = "Elastic Net Penalized Linear Reg.", 
+                  metric_name = "Spearman's Rho",
+                  group_name = "Halves")
+logReg_halves_null_plot <- plot_null_results(metrics_null = metrics_halves_null$logReg,
+                  metrics_test = metric_halves_logReg_sig,
+                  model_name = "Logistic Reg.", 
+                  metric_name = "AUC",
+                  group_name = "Halves")
+logRegL1_halves_null_plot <- plot_null_results(metrics_null = metrics_halves_null$logRegL1,
+                  metrics_test = metric_halves_logRegL1_sig,
+                  model_name = "L1 Penalized Logistic Reg.", 
+                  metric_name = "AUC",
+                  group_name = "Halves")
+logRegL2_halves_null_plot <- plot_null_results(metrics_null = metrics_halves_null$logRegL2,
+                  metrics_test = metric_halves_logRegL2_sig,
+                  model_name = "L2 Penalized Logistic Reg.", 
+                  metric_name = "AUC",
+                  group_name = "Halves")
+logRegENet_halves_null_plot <- plot_null_results(metrics_null = metrics_halves_null$logRegENet,
+                  metrics_test = metric_halves_logRegENet_sig,
+                  model_name = "Elastic Net Penalized Logistic Reg.", 
+                  metric_name = "AUC",
+                  group_name = "Halves")
+SVMlinear_halves_null_plot <- plot_null_results(metrics_null = metrics_halves_null$SVMlinear,
+                  metrics_test = metric_halves_SVMlinear_sig,
+                  model_name = "SVM Linear", 
+                  metric_name = "AUC",
+                  group_name = "Halves")
+SVMpoly_halves_null_plot <- plot_null_results(metrics_null = metrics_halves_null$SVMpoly,
+                  metrics_test = metric_halves_SVMpoly_sig,
+                  model_name = "SVM Polynomial", 
+                  metric_name = "AUC",
+                  group_name = "Halves")
+rf_halves_null_plot <- plot_null_results(metrics_null = metrics_halves_null$rf,
+                  metrics_test = metric_halves_rf_sig,
+                  model_name = "RF", 
+                  metric_name = "AUC",
+                  group_name = "Halves")
+
+linReg_quintiles_null_plot <- plot_null_results(metrics_null = metrics_quintiles_null$linReg,
+                  metrics_test = metric_quintiles_linReg_sig,
+                  model_name = "Linear Reg.", 
+                  metric_name = "Spearman's Rho",
+                  group_name = "Quintiles")
+linRegL1_quintiles_null_plot <- plot_null_results(metrics_null = metrics_quintiles_null$linRegL1,
+                  metrics_test = metric_quintiles_linRegL1_sig,
+                  model_name = "L1 Penalized Linear Reg.", 
+                  metric_name = "Spearman's Rho",
+                  group_name = "Quintiles")
+linRegL2_quintiles_null_plot <- plot_null_results(metrics_null = metrics_quintiles_null$linRegL2,
+                  metrics_test = metric_quintiles_linRegL2_sig,
+                  model_name = "L2 Penalized Linear Reg.", 
+                  metric_name = "Spearman's Rho",
+                  group_name = "Quintiles")
+linRegENet_quintiles_null_plot <- plot_null_results(metrics_null = metrics_quintiles_null$linRegENet,
+                  metrics_test = metric_quintiles_linRegENet_sig,
+                  model_name = "Elastic Net Penalized Linear Reg.", 
+                  metric_name = "Spearman's Rho",
+                  group_name = "Quintiles")
+logReg_quintiles_null_plot <- plot_null_results(metrics_null = metrics_quintiles_null$logReg,
+                  metrics_test = metric_quintiles_logReg_sig,
+                  model_name = "Logistic Reg.", 
+                  metric_name = "AUC",
+                  group_name = "Quintiles")
+logRegL1_quintiles_null_plot <- plot_null_results(metrics_null = metrics_quintiles_null$logRegL1,
+                  metrics_test = metric_quintiles_logRegL1_sig,
+                  model_name = "L1 Penalized Logistic Reg.", 
+                  metric_name = "AUC",
+                  group_name = "Quintiles")
+logRegL2_quintiles_null_plot <- plot_null_results(metrics_null = metrics_quintiles_null$logRegL2,
+                  metrics_test = metric_quintiles_logRegL2_sig,
+                  model_name = "L2 Penalized Logistic Reg.", 
+                  metric_name = "AUC",
+                  group_name = "Quintiles")
+logRegENet_quintiles_null_plot <- plot_null_results(metrics_null = metrics_quintiles_null$logRegENet,
+                  metrics_test = metric_quintiles_logRegENet_sig,
+                  model_name = "Elastic Net Penalized Logistic Reg.", 
+                  metric_name = "AUC",
+                  group_name = "Quintiles")
+SVMlinear_quintiles_null_plot <- plot_null_results(metrics_null = metrics_quintiles_null$SVMlinear,
+                  metrics_test = metric_quintiles_SVMlinear_sig,
+                  model_name = "SVM Linear", 
+                  metric_name = "AUC",
+                  group_name = "Quintiles")
+SVMpoly_quintiles_null_plot <- plot_null_results(metrics_null = metrics_quintiles_null$SVMpoly,
+                  metrics_test = metric_quintiles_SVMpoly_sig,
+                  model_name = "SVM Polynomial", 
+                  metric_name = "AUC",
+                  group_name = "Quintiles")
+rf_quintiles_null_plot <- plot_null_results(metrics_null = metrics_quintiles_null$rf,
+                  metrics_test = metric_quintiles_rf_sig,
+                  model_name = "RF", 
+                  metric_name = "AUC",
+                  group_name = "Quintiles")
+
+
+```
+
+
+Another way to compare our results to the null distribution is in a series of violin plots. First, we'll convert our null distribution data into long format. 
+
+```{r clean_violin_nulls}
+
+metrics_halves_null_long <- metrics_halves_null %>%
+  select(-X) %>%
+  pivot_longer(everything(), names_to = "Model_Method", values_to = "Metric_Value") %>%
+  mutate(Dataset = rep("Including all cell lines"),
+         Model_Type = case_when(Model_Method %in% c("linReg", "linRegENet", "linRegL1", "linRegL2") ~ "Regression", 
+                            Model_Method %in% c("logReg", "logRegENet", "logRegL1", "logRegL2", 
+                                                "SVMlinear", "SVMpoly", "rf") ~ "Classification"),
+         Model_Method = fct_rev(recode_factor(factor(Model_Method), 
+                               linReg = "Simple Linear Regr.", 
+                               linRegENet = "Penalized Linear Regr.\n(Elastic Net)",
+                               linRegL1 = "Penalized Linear Regr.\n(L1)",
+                               linRegL2 = "Penalized Linear Regr.\n(L2)", 
+                               logReg = "Simple Logistic Regr.",
+                               logRegENet = "Penalized Logistic Regr.\n(Elastic Net)",
+                               logRegL1 = "Penalized Logistic Regr.\n(L1)",
+                               logRegL2 = "Penalized Logistic Regr.\n(L2)", 
+                               SVMlinear = "SVM\n(Linear Kernel)", 
+                               SVMpoly = "SVM\n(Polynomial Kernel)",
+                               rf = "Random Forest",
+                               .ordered = TRUE)))
+
+metrics_quintiles_null_long <- metrics_quintiles_null %>%
+  select(-X) %>%
+  pivot_longer(everything(), names_to = "Model_Method", values_to = "Metric_Value") %>%
+  mutate(Dataset = rep("Including only cell lines with extreme signature expression\n(1st/5th signature score quintiles)"),
+         Model_Type = case_when(Model_Method %in% c("linReg", "linRegENet", "linRegL1", "linRegL2") ~ "Regression", 
+                            Model_Method %in% c("logReg", "logRegENet", "logRegL1", "logRegL2", 
+                                                "SVMlinear", "SVMpoly", "rf") ~ "Classification"),
+         Model_Method = fct_rev(recode_factor(factor(Model_Method), 
+                               linReg = "Simple Linear Regr.", 
+                               linRegENet = "Penalized Linear Regr.\n(Elastic Net)",
+                               linRegL1 = "Penalized Linear Regr.\n(L1)",
+                               linRegL2 = "Penalized Linear Regr.\n(L2)", 
+                               logReg = "Simple Logistic Regr.",
+                               logRegENet = "Penalized Logistic Regr.\n(Elastic Net)",
+                               logRegL1 = "Penalized Logistic Regr.\n(L1)",
+                               logRegL2 = "Penalized Logistic Regr.\n(L2)", 
+                               SVMlinear = "SVM\n(Linear Kernel)", 
+                               SVMpoly = "SVM\n(Polynomial Kernel)",
+                               rf = "Random Forest",
+                               .ordered = TRUE)))
+
+metrics_all_null_long <- rbind(metrics_halves_null_long, metrics_quintiles_null_long)
+
+metrics_rho_null_long <- metrics_all_null_long %>%
+  filter(Model_Type == "Regression")
+
+metrics_auc_null_long <- metrics_all_null_long %>%
+  filter(Model_Type == "Classification")
+
+```
+
+Using these null distributions, let's find the cutoff for the 95% confidence range. 
+
+```{r find_cutoff}
+
+
+metrics_all_null_cutoff <- metrics_all_null_long %>%
+  group_by(Dataset, Model_Method) %>%
+  summarize(cutoff_95 = quantile(Metric_Value, 0.95, na.rm=TRUE),
+            cutoff_100 = quantile(Metric_Value, 1, na.rm = TRUE))
+
+# sanity check
+# test <- metrics_all_null_long %>%
+#   filter(Dataset == "Including all cell lines" & Model_Method == "Simple Linear Regr.")
+# quantile(test$Metric_Value, 0.95, na.rm=TRUE)
+# test <- metrics_all_null_long %>%
+#   filter(Dataset == "Including only cell lines with extreme signature expression\n(1st/5th signature score quintiles)" & Model_Method == "Penalized Logistic Regr.\n(L2)")
+# quantile(test$Metric_Value, 0.95, na.rm=TRUE)
+
+```
+
+
+And here, we'll format our actual cissig performance to compare to the null. 
+
+```{r clean_violin_actual}
+
+metrics_sig_long <- data.frame(metric_sig_all) %>%
+  mutate(Dataset = c("Including all cell lines", "Including only cell lines with extreme signature expression\n(1st/5th signature score quintiles)")) %>%
+  pivot_longer(-Dataset, names_to = "Model_Method", values_to = "Metric_Value") %>%
+  mutate(Model_Type = case_when(Model_Method %in% c("linReg", "linRegENet", "linRegL1", "linRegL2") ~ "Regression", 
+                            Model_Method %in% c("logReg", "logRegENet", "logRegL1", "logRegL2", 
+                                                "SVMlinear", "SVMpoly", "rf") ~ "Classification"),
+         Model_Method = fct_rev(recode_factor(factor(Model_Method), 
+                               linReg = "Simple Linear Regr.", 
+                               linRegENet = "Penalized Linear Regr.\n(Elastic Net)",
+                               linRegL1 = "Penalized Linear Regr.\n(L1)",
+                               linRegL2 = "Penalized Linear Regr.\n(L2)", 
+                               logReg = "Simple Logistic Regr.",
+                               logRegENet = "Penalized Logistic Regr.\n(Elastic Net)",
+                               logRegL1 = "Penalized Logistic Regr.\n(L1)",
+                               logRegL2 = "Penalized Logistic Regr.\n(L2)", 
+                               SVMlinear = "SVM\n(Linear Kernel)", 
+                               SVMpoly = "SVM\n(Polynomial Kernel)",
+                               rf = "Random Forest",
+                               .ordered = TRUE))) %>%
+  inner_join(metrics_all_null_cutoff, by = c("Dataset", "Model_Method"))
+
+metrics_rho_sig_long <- metrics_sig_long %>%
+  filter(Model_Type == "Regression")
+
+metrics_auc_sig_long <- metrics_sig_long %>%
+  filter(Model_Type == "Classification")
+
+```
+
+Now, we'll plot these null distributions. 
+
+```{r clean_violin_nulls}
+
+g1 <- ggplot(metrics_rho_null_long, aes(x = Metric_Value, y = Model_Method)) +
+  facet_wrap(~Dataset) +
+  geom_violin(trim = TRUE, fill = "#e1d5c9") +
+  geom_segment(data = metrics_rho_sig_long, aes(y = Model_Method, yend = Model_Method, 
+                                                x = cutoff_95, xend = cutoff_100), 
+               size = 3, color = "seashell4", alpha = 0.65) +
+  geom_point(data = metrics_rho_sig_long, aes(x = Metric_Value, y = Model_Method, color = "red")) +
+  labs(y = "Regression Modeling Method",
+       x = "Spearman's Rho") +
+  theme_bw() +
+  theme(legend.position = "none",
+        strip.background = element_rect(fill="seashell3"))
+
+
+g2 <- ggplot(metrics_auc_null_long, aes(x = Metric_Value, y = Model_Method)) +
+  facet_wrap(~Dataset) +
+  geom_violin(trim = TRUE, fill = "#e1d5c9") +
+  geom_segment(data = metrics_auc_sig_long, aes(y = Model_Method, yend = Model_Method, 
+                                                x = cutoff_95, xend = cutoff_100), 
+               size = 3, color = "seashell4", alpha = 0.65) +
+  geom_point(data = metrics_auc_sig_long, aes(x = Metric_Value, y = Model_Method, color = "red")) +
+  labs(x = "AUC", y = "Classification Modeling Method") +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = "seashell3")) + 
+  guides(color = "none")
+
+
+g1 / g2
+
+
+ggsave(here("Results", "Cisplatin", "Plots", "nulldistribution_violins.png"), height = 6, width = 9, g1 / g2)
+
+
+f4_plot <- (
+  (wrap_elements(full = (metrics_halves_sig$linReg[[2]]$plots + 
+     theme(axis.text = element_text(size = 8),
+           axis.title = element_text(size = 10),
+           plot.title = element_blank(),
+           plot.margin = ggplot2::margin(20, 10, 2, 2, "pt")))) +
+  wrap_elements(full = linReg_halves_null_plot + 
+     theme(axis.text = element_text(size = 8),
+           axis.title = element_text(size = 10),
+           plot.title = element_blank(),
+           plot.margin = ggplot2::margin(20, 10, 2, 2, "pt"))) + 
+    plot_spacer()) /
+    (g1 +
+       theme(axis.text = element_text(size = 8),
+           axis.title = element_text(size = 10),
+           plot.margin = ggplot2::margin(2, 10, 2, 2, "pt"))) /
+    (g2 + 
+       theme(axis.text = element_text(size = 8),
+           axis.title = element_text(size = 10),
+           plot.margin = ggplot2::margin(2, 10, 2, 2, "pt")))) + 
+  plot_annotation(tag_levels = "A")
+
+ggsave(here("Results", "Cisplatin", "Plots", "F4_nulldistribution_violins.png"), height = 9, width = 9, f4_plot)
+
+
+```
+
+
+```{r supps_modeling_results, purl=FALSE}
+
+# Simple Linear Regression
+p_linReg <- (
+  (metrics_halves_sig$linReg[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linReg[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linReg[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linReg[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linReg[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (linReg_halves_null_plot +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_quintiles_sig$linReg[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linReg[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linReg[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linReg[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linReg[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (linReg_quintiles_null_plot + 
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15)))) + 
+  plot_annotation(tag_levels = 'A') + 
+  plot_layout(ncol = 3)
+ggsave(here("Results", drug, "Plots", "Null_Model_Metrics", 
+            paste0("supp_linReg_",
+                   "boot", n,
+                   "_deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       width = 11, height = 14, p_linReg)
+
+
+p_linRegENet <- (
+  (metrics_halves_sig$linRegENet[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linRegENet[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linRegENet[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linRegENet[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linRegENet[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (linRegENet_halves_null_plot +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_quintiles_sig$linRegENet[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linRegENet[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linRegENet[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linRegENet[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linRegENet[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (linRegENet_quintiles_null_plot + 
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15)))) + 
+  plot_annotation(tag_levels = 'A') + 
+  plot_layout(ncol = 3)
+ggsave(here("Results", drug, "Plots", "Null_Model_Metrics", 
+            paste0("supp_linRegENet_",
+                   "boot", n,
+                   "_deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       width = 11, height = 14, p_linRegENet)
+
+
+
+p_linRegL1 <- (
+  (metrics_halves_sig$linRegL1[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linRegL1[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linRegL1[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linRegL1[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linRegL1[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (linRegL1_halves_null_plot +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_quintiles_sig$linRegL1[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linRegL1[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linRegL1[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linRegL1[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linRegL1[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (linRegL1_quintiles_null_plot + 
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15)))) + 
+  plot_annotation(tag_levels = 'A') + 
+  plot_layout(ncol = 3)
+ggsave(here("Results", drug, "Plots", "Null_Model_Metrics", 
+            paste0("supp_linRegL1_",
+                   "boot", n,
+                   "_deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")), 
+       width = 11, height = 14, p_linRegL1)
+
+
+p_linRegL2 <- (
+  (metrics_halves_sig$linRegL2[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linRegL2[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linRegL2[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linRegL2[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$linRegL2[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (linRegL2_halves_null_plot +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_quintiles_sig$linRegL2[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linRegL2[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linRegL2[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linRegL2[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$linRegL2[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (linRegL2_quintiles_null_plot + 
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15)))) + 
+  plot_annotation(tag_levels = 'A') + 
+  plot_layout(ncol = 3)
+ggsave(here("Results", drug, "Plots", "Null_Model_Metrics", 
+            paste0("supp_linRegL2_",
+                   "boot", n,
+                   "_deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       width = 11, height = 14, p_linRegL2)
+
+
+p_logReg <- (
+  (metrics_halves_sig$logReg[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logReg[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logReg[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logReg[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logReg[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (logReg_halves_null_plot +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_quintiles_sig$logReg[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logReg[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logReg[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logReg[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logReg[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (logReg_quintiles_null_plot + 
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15)))) + 
+  plot_annotation(tag_levels = 'A') + 
+  plot_layout(ncol = 3)
+ggsave(here("Results", drug, "Plots", "Null_Model_Metrics", 
+            paste0("supp_logReg_",
+                   "boot", n,
+                   "_deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       width = 11, height = 14, p_logReg)
+
+p_logRegENet <- (
+  (metrics_halves_sig$logRegENet[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logRegENet[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logRegENet[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logRegENet[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logRegENet[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (logRegENet_halves_null_plot +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_quintiles_sig$logRegENet[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logRegENet[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logRegENet[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logRegENet[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logRegENet[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (logRegENet_quintiles_null_plot + 
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15)))) + 
+  plot_annotation(tag_levels = 'A') + 
+  plot_layout(ncol = 3)
+ggsave(here("Results", drug, "Plots", "Null_Model_Metrics", 
+            paste0("supp_logRegENet_",
+                   "boot", n,
+                   "_deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+        width = 11, height = 14, p_logRegENet)
+
+
+p_logRegL1 <- (
+  (metrics_halves_sig$logRegL1[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logRegL1[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logRegL1[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logRegL1[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logRegL1[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (logRegL1_halves_null_plot +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_quintiles_sig$logRegL1[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logRegL1[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logRegL1[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logRegL1[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logRegL1[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (logRegL1_quintiles_null_plot + 
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15)))) + 
+  plot_annotation(tag_levels = 'A') + 
+  plot_layout(ncol = 3)
+ggsave(here("Results", drug, "Plots", "Null_Model_Metrics", 
+            paste0("supp_logRegL1_",
+                   "boot", n,
+                   "_deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+        width = 11, height = 14, p_logRegL1)
+
+
+p_logRegL2 <- (
+  (metrics_halves_sig$logRegL2[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logRegL2[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logRegL2[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logRegL2[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$logRegL2[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (logRegL2_halves_null_plot +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_quintiles_sig$logRegL2[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logRegL2[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logRegL2[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logRegL2[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$logRegL2[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (logRegL2_quintiles_null_plot + 
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15)))) + 
+  plot_annotation(tag_levels = 'A') + 
+  plot_layout(ncol = 3)
+ggsave(here("Results", drug, "Plots", "Null_Model_Metrics", 
+            paste0("supp_logRegL2_",
+                   "boot", n,
+                   "_deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       width = 11, height = 14, p_logRegL2)
+
+
+p_SVMlinear <- (
+  (metrics_halves_sig$SVMlinear[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$SVMlinear[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$SVMlinear[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$SVMlinear[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$SVMlinear[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (SVMlinear_halves_null_plot +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_quintiles_sig$SVMlinear[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$SVMlinear[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$SVMlinear[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$SVMlinear[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$SVMlinear[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (SVMlinear_quintiles_null_plot + 
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15)))) + 
+  plot_annotation(tag_levels = 'A') + 
+  plot_layout(ncol = 3)
+ggsave(here("Results", drug, "Plots", "Null_Model_Metrics", 
+            paste0("supp_SVMlinear_",
+                   "boot", n,
+                   "_deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       width = 11, height = 14, p_SVMlinear)
+
+p_SVMpoly <- (
+  (metrics_halves_sig$SVMpoly[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$SVMpoly[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$SVMpoly[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$SVMpoly[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$SVMpoly[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (SVMpoly_halves_null_plot +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_quintiles_sig$SVMpoly[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$SVMpoly[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$SVMpoly[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$SVMpoly[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$SVMpoly[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (SVMpoly_quintiles_null_plot + 
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15)))) + 
+  plot_annotation(tag_levels = 'A') + 
+  plot_layout(ncol = 3)
+ggsave(here("Results", drug, "Plots", "Null_Model_Metrics", 
+            paste0("supp_SVMpoly_",
+                   "boot", n,
+                   "_deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+        width = 11, height = 14, p_SVMpoly)
+
+
+
+p_rf <- (
+  (metrics_halves_sig$rf[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$rf[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$rf[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$rf[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_halves_sig$rf[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (rf_halves_null_plot +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) +
+  (metrics_quintiles_sig$rf[[1]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$rf[[2]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$rf[[3]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$rf[[4]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (metrics_quintiles_sig$rf[[5]]$plots +
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15))) + 
+  (rf_quintiles_null_plot + 
+     theme(axis.text = element_text(size = 12),
+           axis.title = element_text(size = 15)))) + 
+  plot_annotation(tag_levels = 'A') + 
+  plot_layout(ncol = 3)
+ggsave(here("Results", drug, "Plots", "Null_Model_Metrics", 
+            paste0("supp_rf_",
+                   "boot", n,
+                   "_deCompPerc", (de_comp_perc*100),
+                   "_rmExtremePerc", rm_extreme_perc*100,
+                   "_samPerm", sam_perm,
+                   "_multPerm", mult_perm,
+                   "_nFolds", n_folds, ".png")),
+       width = 11, height = 14, p_rf)
+
+
+
+```
+
+
