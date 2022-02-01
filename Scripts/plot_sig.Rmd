@@ -201,6 +201,8 @@ waterfall_bm_plot <- waterfall_bm_results[['plot']]
 
 waterfall_bm_plot
 
+View(waterfall_bm_results$df)
+
 
 ```
 ## Find prevalence of mutations
@@ -220,6 +222,44 @@ mutation_perc_df <- ranked_bm_df %>%
   mutate(gene_perc = paste0(variable, " (", round(bm_row_perc, 2), "%)")) %>%
   arrange(desc(bm_row_perc)) %>%
   filter(variable!="sig_score")
+
+```
+
+
+## Assess mutation difference via chi-square
+
+```{r mutation_chi}
+
+mutation_chi_df <- waterfall_bm_results$df %>%
+  select(-labels) %>%
+  mutate(score_high = ifelse(sig_score >= median(sig_score), 1, 0))
+
+
+genes_vec <- c()
+p_value_vec <- c()
+p_corr_vec <- c()
+
+for(ddr_gene in genes_interest){
+  tempTable <- table(mutation_chi_df$score_high, mutation_chi_df %>% pull(ddr_gene))
+  print(ddr_gene)
+  chi_results <- chisq.test(tempTable)
+  genes_vec <- c(genes_vec, ddr_gene)
+  p_value_vec <- c(p_value_vec, chi_results$p.value)
+  p_corr_vec <- c(p_corr_vec, chi_results$p.value*length(genes_interest))
+}
+
+chi_results_df <- data.frame(gene_name = genes_vec, 
+                             p_value = p_value_vec,
+                             p_corrected = p_corr_vec) %>%
+  mutate(p_corrected = ifelse(p_corrected > 1, 1, p_corrected))
+
+
+```
+
+
+
+## Plot heatmap
+```{r plot_heatmap}
 
 # create df for pheatmap input
 heatmap_df <- ranked_bm_df %>%
