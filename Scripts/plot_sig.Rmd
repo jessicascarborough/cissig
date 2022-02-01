@@ -113,6 +113,145 @@ tidy_signature <- format_model_data(tidy_data = tidy_gdsc,
 
 ```
 
+# Plot cissig score by mutation status
+
+## Organize Data
+
+First, we'll need to organize the mutation data so each gene is a column and each cell line is a row, while the data entry is classification of the mutation. 
+
+```{r organize_mut_data}
+
+# determine if genes of interest are present in dataset
+genes_interest <- c("BRCA1", "BRCA2", "PALB2", "TP53", "CHEK1", "CHEK2", "ATM", 
+                    "BARD1", "BRIP1", "PTEN", "RAD51C", "RAD51D", "NTHL1",
+                    "ATM", "FAM175A", "MRE11A", "NBN")
+
+genes_interest[!(genes_interest %in% gdsc_dna$Gene)] # all present
+
+gdsc_dna_mut_count <- gdsc_dna %>%
+  mutate(mutation_present = 1) %>%
+  filter(Gene %in% genes_interest) %>%
+  pivot_wider(id_cols = cosmic_id, names_from = Gene, 
+              values_from = mutation_present, values_fn = {sum}, 
+              ### values_fn = {sum} = add value that is 0 for none 
+              ### or n for the sum of all mutations present
+              values_fill = 0) 
+
+gdsc_dna_mut_binary <- gdsc_dna %>%
+  mutate(mutation_present = 1) %>%
+  filter(Gene %in% genes_interest) %>%
+  pivot_wider(id_cols = cosmic_id, names_from = Gene, 
+              values_from = mutation_present, values_fn = {mean}, 
+              ### values_fn = {mean} = add value that is 0 for none 
+              ### or 1 for any number of mutations present
+              values_fill = 0)
+
+tidy_mutation_sig <- gdsc_dna_mut_binary %>%
+  inner_join(tidy_signature %>% select(cosmic_id, sig_score)) %>%
+  select(cosmic_id, sig_score, everything())
+
+```
+
+## Waterfall plot of CisSig Score
+
+```{r waterfall_cissig}
+
+waterfall.plot <- function(df, value_col){
+  # This function will create a waterfall style bar plot using the data from a
+  # column, value_col, in df.
+  # The x axis will display the labels, row names, from the dataframe.
+  # The y axis will display the value for each row in the specified column.
+  # The x axis will be ordered based on descending y axis value, creating a
+  # the waterfall style.
+  # Each plot will be saved as a PNG
+  # Format dataset to contain labels as factor ordered by `value_col` value
+  df$labels <- row.names(df)
+  df <- df %>% arrange(desc(UQ(sym(value_col))))
+  df$labels <- factor(df$labels, levels=df$labels)
+  # Create Plot
+  waterfall <- ggplot(df, 
+                      aes(x=labels, 
+                      y = UQ(sym(value_col)), 
+                      fill = UQ(sym(value_col)))) +
+    geom_bar(stat="identity") + 
+    scale_fill_gradient(low="#ecf9ec", high="#0d260d") +
+    ggtitle(paste("Ranked CisSig Score")) +
+    ylab("CisSig Score") +
+    xlab("Samples") +
+    # ylim(0, 1) +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_blank(),
+          axis.ticks = element_blank(),
+          legend.position = "none")
+  # Save Plot
+  plotDir <- here("Plots")
+  dir.create(file.path(plotDir), showWarnings = FALSE)# Create dir if necessary
+  filename <- paste0("cissig_score_Waterfall.png")
+  png(file.path(plotDir, filename), width = 1000, height = 600, units = "px", 
+      res = 125)
+  print(waterfall)
+  dev.off()
+  return(list(df = df, plot = waterfall))
+}
+
+waterfall_bm_results <- waterfall.plot(df = tidy_mutation_sig, value_col = "sig_score")
+ranked_bm_df <- waterfall_bm_results[['df']]
+waterfall_bm_plot <- waterfall_bm_results[['plot']]
+
+waterfall_bm_plot
+
+
+```
+## Find prevalence of mutations
+
+```{r mutation_prev}
+
+# Assess mutation prevalence using binary matrix dataframe, `ranked_bm_df` 
+mutation_perc_df <- ranked_bm_df %>%
+  column_to_rownames("cosmic_id") %>%
+  select(!c(labels)) %>%
+  rownames_to_column() %>%
+    pivot_longer(-rowname, 'variable', 'value') %>%
+    pivot_wider(variable, rowname) %>%
+  mutate(bm_row_count = rowSums(select(., -variable))) %>%
+  mutate(bm_row_perc = bm_row_count/nrow(ranked_bm_df)*100) %>%
+  select(variable, bm_row_perc) %>%
+  mutate(gene_perc = paste0(variable, " (", round(bm_row_perc, 2), "%)")) %>%
+  arrange(desc(bm_row_perc)) %>%
+  filter(variable!="sig_score")
+
+# create df for pheatmap input
+heatmap_df <- ranked_bm_df %>%
+  # remove variables not being used directly in heatmap (score is used as a label, not in the heatmap itself)
+  select(-c("sig_score", "labels")) %>%
+  # transpose df
+  pivot_longer(!cosmic_id, 'variable', 'value') %>%
+  pivot_wider(variable, cosmic_id) %>%
+  inner_join(mutation_perc_df) %>%
+  arrange(desc(bm_row_perc)) %>%
+  column_to_rownames("gene_perc") %>%
+  select(-c(variable, bm_row_perc))
+
+# create score annotation for heatmap (row names must match column names in heatmap_df)
+annotation_col = ranked_bm_df %>%
+  select(cosmic_id, `CisSig Score` = sig_score) %>%
+  column_to_rownames("cosmic_id")
+
+annotation_colors <- list(`CisSig Score` = c("#ecf9ec", "#0d260d"))
+
+pheatmap(heatmap_df, cluster_rows = FALSE, cluster_cols = FALSE,
+         show_colnames = FALSE, width = 10, height = 7,
+         color = c("#ecf2f9", "#007399"), legend_breaks = c(0, 1),
+         legend_labels = c("Mutation Absent", "Mutation Present"),
+         annotation_col = annotation_col, 
+         annotation_colors = annotation_colors,
+         gaps_row = c(seq(1, nrow(heatmap_df))),
+         filename = here("Results", "Cisplatin", "Plots", "mutation_heatmap.png")
+         )
+
+
+```
 
 
 # Plot subtype score violin
@@ -847,6 +986,8 @@ SigQC is a useful package created by Dr. Andrew Dhawan. It was inspired by a nee
 
 ```{r run_sigQC, include=FALSE}
 
+dir.create(here("Results", drug, "SigQC"), showWarnings = FALSE)
+
 mRNA_expr_matrix <- list()
 
 mRNA_expr_matrix[["tcga"]] <- data.frame(t(as.matrix(tcga_data %>% select(-c(sample_ID, tcga_label)))))
@@ -855,7 +996,7 @@ gene_sigs_list <- list()
 gene_sigs_list[["final_sig"]] <- signature
 
 seeds_list <- readRDS(file = here("Results", drug, "DE",
-                                 paste0("DE_genes_",
+                                 paste0("DE_genes_up_",
                                         "deCompPerc", de_comp_perc*100,
                                         "_rmExtremePerc", rm_extreme_perc*100,
                                         "_samPerm", sam_perm,
@@ -875,7 +1016,7 @@ boot_n <- 50
 
 make_all_plots(gene_sigs_list, mRNA_expr_matrix, showResults = showResults,
                doNegativeControl = FALSE,
-               out_dir = "../Results/Cisplatin/SigQC")
+               out_dir = here("Results", drug, "SigQC"))
 
 ```
 

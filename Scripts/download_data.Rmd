@@ -12,6 +12,7 @@ knitr::opts_chunk$set(echo = TRUE)
 ```{r load_packages}
 
 library(RTCGAToolbox)
+library(httr)
 library(here)
 library(tidyverse)
 
@@ -26,6 +27,7 @@ We'll start by creating some directories to store these data.
 dir.create(here("Data"), showWarnings = FALSE)
 dir.create(here("Data", "GDSC"), showWarnings = FALSE)
 dir.create(here("Data", "TCGA"), showWarnings = FALSE)
+dir.create(here("Data", "GSE"), showWarnings = FALSE)
 
 ```
 
@@ -96,6 +98,37 @@ gdsc_dr <- get_dr(here("Data", "GDSC"))
 ```
 
 As originally loaded, the drug response data set (`gdsc_dr`) has `r nrow(gdsc_dr)` rows and `r ncol(gdsc_dr)` columns.
+
+
+## DNA Mutation Data
+
+Next, we'll download the DNA mutation data, creating a function `get_dna`. This function uses `GET` to download the DNA data from the specific URL, and `write_disk` to store these data in the `Data` directory. Both functions are from the `httr` package. We'll read this file using `read_excel` from the `readxl` package and store the data as a local variable, `data_raw_meta`. 
+
+```{r load_dna}
+
+get_dna <- function(cache) {
+  
+  # check if file has already been downloaded at the provided cache
+  if(!file.exists(paste0(cache, "/gdsc_dna.xlsx"))) {
+    #download the data
+    url_dna <- "https://www.cancerrxgene.org/gdsc1000/GDSC1000_WebResources//Data/suppData/TableS2C.xlsx"
+    GET(url_dna, write_disk(here(cache, "gdsc_dna.xlsx")))
+    
+  } else {
+    message("using cached gdsc data")
+  }
+  
+  #read into R
+  df <- suppressWarnings(readxl::read_excel(paste0(cache, "/gdsc_dna.xlsx"), skip = 18))
+  
+  return(df)
+}
+
+data_raw_dna <- get_dna(here("Data", "GDSC"))
+
+```
+
+As originally loaded, the `data_raw_dna` data set has `r nrow(data_raw_dna)` rows and `r ncol(data_raw_dna)` columns. 
 
 
 ### Cell Line Meta Data

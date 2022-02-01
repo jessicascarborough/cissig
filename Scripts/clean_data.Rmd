@@ -42,6 +42,8 @@ dir.create(here("Results", drug, "Plots"), showWarnings = FALSE)
 dir.create(here("Results", drug, "Plots", "Linear_Models"), showWarnings = FALSE)
 dir.create(here("Results", drug, "Plots", "ROC_Curves"), showWarnings = FALSE)
 dir.create(here("Results", drug, "Plots", "Null_Model_Metrics"), showWarnings = FALSE)
+dir.create(here("Results", drug, "Plots", "External_Clinical_Testing"), showWarnings = FALSE)
+
 
 ```
 
@@ -141,6 +143,14 @@ gdsc_expr <- gdsc_expr %>%
 ```
 
 
+```{r clean_mut_gdsc}
+
+gdsc_dna <- suppressWarnings(readxl::read_excel(here("Data", "GDSC", "gdsc_dna.xlsx"), skip = 18)) %>%
+  mutate(cosmic_id = paste0("DATA.", COSMIC_ID)) %>%
+  select(-COSMIC_ID)
+
+```
+
 ## Clean drug response
 
 
@@ -184,6 +194,9 @@ gdsc_meta_epi <- gdsc_meta_epi %>%
 gdsc_expr <- gdsc_expr %>%
   filter(cosmic_id %in% tidy_gdsc$cosmic_id)
 
+gdsc_dna <- gdsc_dna %>% 
+  filter(cosmic_id %in% tidy_gdsc$cosmic_id)
+
 ```
 
 # Filter for only overlapping genes between TCGA and GDSC
@@ -212,7 +225,7 @@ tcga_data <- tcga_data %>%
 
 ```{r save_data}
 
-save(gdsc_expr, gdsc_dr, gdsc_meta_epi, tcga_data, tidy_gdsc,
+save(gdsc_expr, gdsc_dr, gdsc_meta_epi, tcga_data, gdsc_dna, tidy_gdsc,
      file = here("Data", drug, "cleaned_gdsc_tcga.RData"))
 
 load(here("Data", drug, "cleaned_gdsc_tcga.RData"))
