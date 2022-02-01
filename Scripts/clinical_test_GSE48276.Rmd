@@ -1,0 +1,1047 @@
+---
+title: "Clinical Testing GSE48276"
+author: "Jessica Scarborough"
+date: "01/16/2021"
+output: html_document
+---
+
+# Preliminaries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load_packages, include=FALSE}
+
+library(here)
+library(survival)
+library(survminer)
+library(patchwork)
+library(rms) # for coxph function that has additional stats
+library(stringr)
+library(tidyverse)
+
+```
+
+# Data Management
+
+## Load signature of interest
+
+```{r load_sig}
+
+de_comp_perc = 0.20
+rm_extreme_perc = 0
+sam_perm = 10000
+mult_perm = 1000
+n_folds = 5
+
+# load signature genes
+cissig <- readRDS(file = here("Results", "Cisplatin", 
+                                 paste0("intersect_sig_",
+                                        "deCompPerc", de_comp_perc*100,
+                                        "_rmExtremePerc", rm_extreme_perc*100,
+                                        "_samPerm", sam_perm,
+                                        "_multPerm", mult_perm,
+                                        "_nFolds", n_folds, ".rds")))
+
+str_flatten(cissig, ", ")
+
+```
+
+
+## Ingest cleaned  data
+
+```{r load_data}
+
+gse4training <- "GSE48276"
+gse4testing <- "GSE70691"
+
+data_tidy <- read.csv(here("Data", "GSE", gse4training, "data_tidy.csv"))
+
+```
+
+## Separate treated and untreated samples
+
+```{r clean_clinical}
+
+data_complete <- data_tidy %>%
+   filter(received_nac %in% c("no", "yes-MVAC/A"))
+
+data_yeschemo <- data_complete %>%
+  filter(received_nac == "yes-MVAC/A")
+
+data_nochemo <- data_complete %>%
+  filter(received_nac == "no")
+
+```
+
+
+# Data Visualization 
+
+Here, we'll look at the distribution of our signature genes. 
+
+```{r data_viz_gene_ex_dist}
+
+ex_long <- data_yeschemo %>%
+   select(all_of(cissig)) %>%
+   pivot_longer(cols = cissig, names_to = "gene", values_to = "expression")
+
+
+ggplot(ex_long, aes(x = gene, y=expression)) +
+  geom_violin(trim = FALSE, scale = "width", aes(fill=gene)) +
+  geom_boxplot(width = 0.12, outlier.shape = NA) +
+  scale_x_discrete(expand = c(0,0)) +
+  # geom_label(aes(x = subtype, y = 28.5, label = n), data = median_group,
+  # label.padding = unit(0.15, "lines")) +
+  coord_flip() +
+  ylab("Expression") + xlab("Gene") + 
+  theme_bw(base_size = 14) +
+  theme(axis.text.y = element_text(angle = 30),
+    axis.title=element_text(face="bold"),
+        legend.position = "none")
+
+```
+
+Remove genes with very low variance. 
+
+```{r filter_var}
+
+# label gene with variance
+ex_long_group <- ex_long %>%
+   dplyr::select(gene, expression) %>%
+   group_by(gene) %>%
+   dplyr::summarize(variance = var(expression)) %>%
+   arrange(variance) %>%
+   mutate(var_high = if_else(variance > 0.1, 1, 0)) 
+
+# merge variance labels with original long dataset
+ex_long_var <- ex_long_group %>%
+   inner_join(ex_long, by = "gene")
+
+# same violin plot as above, colored by variance label (high/low)
+ggplot(ex_long_var, aes(x = gene, y=expression)) +
+  geom_violin(trim = FALSE, scale = "width", aes(fill=var_high)) +
+  geom_boxplot(width = 0.12, outlier.shape = NA) +
+  scale_x_discrete(expand = c(0,0)) +
+  # geom_label(aes(x = subtype, y = 28.5, label = n), data = median_group,
+  # label.padding = unit(0.15, "lines")) +
+  coord_flip() +
+  ylab("Expression") + xlab("Gene") + 
+  theme_bw(base_size = 10) +
+  theme(axis.text.y = element_text(angle = 30),
+    axis.title=element_text(face="bold"),
+        legend.position = "none")
+
+# create vector of only cissig genes with high variance
+cissig_highvar <- ex_long_var %>%
+   filter(var_high == 1) %>%
+   pull(gene)
+
+cissig_highvar <- unique(cissig_highvar)
+
+```
+
+# Data Analysis
+
+We'll start by creating our `Surv` objects. We'll need one for the cohort that received NAC and the one that didn't receive chemo. 
+
+```{r surv_obj}
+
+surv_yeschemo_os <- Surv(time = data_yeschemo$survival_mo, 
+                         event = data_yeschemo$os)
+
+surv_nochemo_os <- Surv(time = data_nochemo$survival_mo, 
+                         event = data_nochemo$os)
+
+```
+
+## Univariate survival analysis
+
+```{r univariate_surv}
+
+sens_genes <- c()
+
+for (gene in cissig_highvar){
+   tempData <- data_yeschemo %>% dplyr::select(gene)
+   cfit <- coxph(surv_yeschemo_os ~ ., data = tempData)
+   # print(summary(cfit))
+   # if (summary(cfit)$logtest["pvalue"] < 0.2 & cfit$coefficients < 0){
+   if (cfit$coefficients < -0.5){
+      print(cfit$coefficients)
+      sens_genes <- c(sens_genes, gene)
+   }
+}
+
+saveRDS(sens_genes, file = here("Results", "Cisplatin", paste0("cissig_trimmed_", gse4training, ".rds")))
+
+```
+
+## Multivariate analysis
+
+### Train model
+
+Using sensitivity genes from univariate analysis
+
+```{r fit_sens_genes_yeschemo}
+
+ 
+# sensData <- data_yeschemo %>% dplyr::select(all_of(cissig_highvar))
+# cfit_yeschemo_nograde <- coxph(surv_yeschemo_os ~ ., data = sensData)
+# summary(cfit_yeschemo_nograde)
+
+# select only genes from `sens_genes`, again to be able to use . in formula
+sensData <- data_yeschemo %>% dplyr::select(all_of(sens_genes))
+cfit_yeschemo_nograde <- coxph(surv_yeschemo_os ~ ., data = sensData)
+summary(cfit_yeschemo_nograde)
+saveRDS(cfit_yeschemo_nograde, file = here("Results", "Cisplatin", 
+                                           paste0("surv_model_trimmedgenes_nograde_", 
+                                                  gse4training, ".rds"))) # this is our final model
+
+
+```
+
+### Assess trained model on original data (`yeschemo`)
+
+Create linear predictor for each sample, classify samples to cohorts based on linear predictor.
+
+```{r predict_yeschemo_original}
+
+data_yeschemo$pred_lp <- predict(cfit_yeschemo_nograde, type = "lp")
+
+data_yeschemo <- data_yeschemo %>%
+      mutate(pred_2grp_med = factor(case_when(pred_lp >= median(pred_lp) ~ "2_High",
+                                pred_lp < median(pred_lp) ~ "1_Low"), 
+                             ordered = TRUE),
+          pred_3grp_tert = factor(case_when(pred_lp < quantile(pred_lp, 0.33) ~ "1_Low",
+                                pred_lp >= quantile(pred_lp, 0.33) &
+                                   pred_lp < quantile(pred_lp, 0.66) ~ "2_Middle",
+                                pred_lp >= quantile(pred_lp, 0.66) ~ "3_High"),
+                                ordered = TRUE),
+          pred_3grp_2550 = factor(case_when(pred_lp < quantile(pred_lp, 0.25) ~ "1_Low",
+                                pred_lp >= quantile(pred_lp, 0.25) &
+                                   pred_lp < quantile(pred_lp, 0.75) ~ "2_Middle",
+                                pred_lp >= quantile(pred_lp, 0.75) ~ "3_High"), 
+                                ordered = TRUE),
+          pred_quar = factor(case_when(pred_lp < quantile(pred_lp, 0.25) ~ "1_Low",
+                                pred_lp >= quantile(pred_lp, 0.25) &
+                                   pred_lp < quantile(pred_lp, 0.50) ~ "2_Middle Low",
+                                pred_lp >= quantile(pred_lp, 0.50) &
+                                   pred_lp < quantile(pred_lp, 0.75) ~ "3_Middle High",
+                                pred_lp >= quantile(pred_lp, 0.75) ~ "4_High"),
+                             ordered = TRUE))
+
+```
+
+
+Plot KM curves based on linear predictor cohorts
+
+```{r km_yeschemo_priginal}
+
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Intercept only
+
+km_yeschemo_int <- survfit(surv_yeschemo_os ~ 1)
+
+ggsurvplot(km_yeschemo_int, data = data_yeschemo,
+   conf.int = TRUE, # Add confidence interval
+   risk.table = TRUE, # Add risk table
+   xlab = "Time in months", # adjust X axis label
+   break.time.by = 24 # add tick every 12 months
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Top/bottom halves
+
+km_yeschemo_css_new <- survfit(surv_yeschemo_os ~ data_yeschemo$pred_2grp_med)
+
+ggsurvplot(km_yeschemo_css_new, data = data_yeschemo, size = 1,
+   palette = c("indianred3", "dodgerblue3"), # custom colors
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.250, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("High Linear Pred.", "Low Linear Pred."), 
+   # labels are opposite of "Cissig score, where higher equals better outcomes
+   title = "CisSig Score Cohorts - Yes Cisplatin",
+   ggtheme = theme_bw() # Change ggplot2 theme
+   )
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Quartiles
+
+km_yeschemo_css_quar <- survfit(surv_yeschemo_os ~ data_yeschemo$pred_quar)
+
+ggsurvplot(km_yeschemo_css_quar, data = data_yeschemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("Quar 4 Lin Pred.", "Quar 3 Lin Pred.", 
+   #                 "Quar 2 Lin Pred.", "Quar 1 Lin Pred."), # labels
+   title = "CisSig Score Quartile Cohorts - Yes Cisplatin",
+   ggtheme = theme_bw() # Change ggplot2 theme
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## 
+
+## Tertiles by 33%
+
+km_yeschemo_css_tert_by33 <- survfit(surv_yeschemo_os ~ data_yeschemo$pred_3grp_tert)
+
+ggsurvplot(km_yeschemo_css_tert_by33, data = data_yeschemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("Lowest third Lin Pred.", "Middle third Lin Pred.",
+   # "Top third Lin Pred."), # labels
+   title = "CisSig Score Tertile Cohorts (by 33%) - Yes Cisplatin",
+   ggtheme = theme_bw() # Change ggplot2 theme
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Tertiles by 25/50/25%
+
+km_yeschemo_css_tert_by25_50_25 <- survfit(surv_yeschemo_os ~ 
+                                              data_yeschemo$pred_3grp_2550)
+
+ggsurvplot(km_yeschemo_css_tert_by25_50_25, data = data_yeschemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("Bottom 25% Lin Pred.", "Middle 25-75% Lin Pred.",
+   # "Top 25% Lin Pred."), # labels
+   title = "CisSig Score Tertile Cohorts (by 25/50/25%) - Yes Cisplatin",
+   ggtheme = theme_bw() # Change ggplot2 theme
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+```
+
+
+### Assess trained model on `nochemo` patients from current dataset
+
+Create linear predictor for each sample, classify samples to cohorts based on linear predictor.
+
+```{r predict_nochemo_original}
+
+data_nochemo$pred_lp <- predict(cfit_yeschemo_nograde, newdata = data_nochemo, type = "lp")
+
+data_nochemo <- data_nochemo %>%
+   
+      mutate(pred_2grp_med = factor(case_when(pred_lp >= median(pred_lp) ~ "2_High",
+                                pred_lp < median(pred_lp) ~ "1_Low"), 
+                             ordered = TRUE),
+          pred_3grp_tert = factor(case_when(pred_lp < quantile(pred_lp, 0.33) ~ "1_Low",
+                                pred_lp >= quantile(pred_lp, 0.33) &
+                                   pred_lp < quantile(pred_lp, 0.66) ~ "2_Middle",
+                                pred_lp >= quantile(pred_lp, 0.66) ~ "3_High"),
+                                ordered = TRUE),
+          pred_3grp_2550 = factor(case_when(pred_lp < quantile(pred_lp, 0.25) ~ "1_Low",
+                                pred_lp >= quantile(pred_lp, 0.25) &
+                                   pred_lp < quantile(pred_lp, 0.75) ~ "2_Middle",
+                                pred_lp >= quantile(pred_lp, 0.75) ~ "3_High"), 
+                                ordered = TRUE),
+          pred_quar = factor(case_when(pred_lp < quantile(pred_lp, 0.25) ~ "1_Low",
+                                pred_lp >= quantile(pred_lp, 0.25) &
+                                   pred_lp < quantile(pred_lp, 0.50) ~ "2_Middle Low",
+                                pred_lp >= quantile(pred_lp, 0.50) &
+                                   pred_lp < quantile(pred_lp, 0.75) ~ "3_Middle High",
+                                pred_lp >= quantile(pred_lp, 0.75) ~ "4_High"),
+                             ordered = TRUE))
+
+```
+
+
+Plot KM curves based on linear predictor cohorts
+
+```{r km_nochemo_original}
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Intercept only
+
+km_nochemo_int <- survfit(surv_nochemo_os ~ 1)
+
+gg_int <- ggsurvplot(km_nochemo_int, data = data_nochemo,
+   conf.int = TRUE, # Add confidence interval
+   risk.table = TRUE, # Add risk table
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 288),
+   break.time.by = 24, # add tick every 12 months
+   title = "No Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Top/bottom halves
+
+km_nochemo_css_new <- survfit(surv_nochemo_os ~ data_nochemo$pred_2grp_med)
+
+gg_grp2_med <- ggsurvplot(km_nochemo_css_new, data = data_nochemo, size = 1,
+   palette = c("indianred3", "dodgerblue3"), # custom colors
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.250, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 288),
+   break.time.by = 24, # break X axis in time intervals
+   legend.labs = c("Low Risk", "High Risk"), # labels
+   # title = "CisSig Score Cohorts - No Cisplatin",
+   title = "No Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Quartiles
+
+km_nochemo_css_quar <- survfit(surv_nochemo_os ~ data_nochemo$pred_quar)
+
+gg_grp4_quar <- ggsurvplot(km_nochemo_css_quar, data = data_nochemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 288),
+   break.time.by = 24, # break X axis in time intervals
+   legend.labs = c("Low Risk", "Middle Low Risk", "Middle High Risk", "High Risk"), # labels
+   # title = "CisSig Score Quartile Cohorts - No Cisplatin",
+   title = "No Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Tertiles by 33%
+
+km_nochemo_css_tert_by33 <- survfit(surv_nochemo_os ~ data_nochemo$pred_3grp_tert)
+
+gg_grp3_tert <- ggsurvplot(km_nochemo_css_tert_by33, data = data_nochemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 288),
+   break.time.by = 24, # break X axis in time intervals
+   legend.labs = c("Low Risk", "Middle Risk", "High Risk"), # labels
+   # title = "CisSig Score Tertile Cohorts (by 33%) - No Cisplatin",
+   title = "No Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Tertiles by 25/50/25%
+
+km_nochemo_css_tert_by25_50_25 <- survfit(surv_nochemo_os ~ 
+                                              data_nochemo$pred_3grp_2550)
+
+gg_grp3_2550 <- ggsurvplot(km_nochemo_css_tert_by25_50_25, data = data_nochemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 288),
+   break.time.by = 24, # break X axis in time intervals
+   legend.labs = c("Low Risk", "Middle Risk", "High Risk"), # labels
+   title = "No Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+```
+
+#### Plot Results together
+
+```{r plot_nochemo_kms_together}
+
+combo_plot <- gg_grp2_med$plot + gg_grp3_tert$plot + 
+   gg_grp2_med$table + gg_grp3_tert$table + 
+   plot_layout(nrow = 2, ncol = 2, heights = c(5, 2))
+
+combo_plot
+
+ggsave(filename = here("Results", "Cisplatin", "Plots", "External_Clinical_Testing", 
+                       paste0(gse4training, "_as_nochemo_testset_", 
+                              "for", gse4training, "_trained_model.png")), 
+       plot = combo_plot, height = 4, width = 15)
+
+```
+
+# Validation of GSE70691 model (`gse4testing`)
+
+```{r load_GSE70691}
+
+# load model
+model_GSE70691 <- readRDS(here("Results", "Cisplatin", "surv_model_trimmedgenes_nograde_GSE70691.rds"))
+
+```
+
+## `yes_chemo`
+
+### Predict GSE48276 (`gse4training`) on GSE70691 (`gse4testing`) trained model
+
+Testing the model on patients in the current dataset (`r gse4training`). First, we'll assign a linear predictor to each of the samples. 
+
+```{r predict_GSE70691}
+
+# create predictions
+data_yeschemo$pred_lp <- predict(model_GSE70691, newdata = data_yeschemo, type = "lp")
+
+```
+
+
+### Find optimal cutpoints
+
+
+Next, we'll find sweep all cutpoint options to find the optimal cutpoint for two (`sweep_cutpoints1`) and three (`sweep_cutpoints2`) groups. 
+
+```{r find_cutpoint}
+
+sweep_cutpoints1 <- function(tidy_data, surv_obj){
+   cutpoints = quantile(tidy_data$pred_lp, prob = seq(0, 1, 0.01))[-(1:5)]
+   cutpoints = cutpoints[-(96:101)]
+   cutpoint_vec <- c()
+   chisq_vec <- c()
+   low_n_vec <- c()
+   high_n_vec <- c()
+   for (i in 1:length(cutpoints)){
+      tidy_data_labs <- tidy_data %>%
+         mutate(pred_group = ifelse(pred_lp <= cutpoints[i], "low", "high"))
+      survdiff_results <- survdiff(surv_obj ~ pred_group, data = tidy_data_labs)
+      chisq_vec <- c(chisq_vec, survdiff_results$chisq)
+      cutpoint_vec <- c(cutpoint_vec, cutpoints[i])
+      low_n_vec <- c(low_n_vec, nrow(tidy_data_labs %>% filter(pred_group == "low")))
+      high_n_vec <- c(high_n_vec, nrow(tidy_data_labs %>% filter(pred_group == "high")))
+   }
+   data.frame(cutpoint = cutpoint_vec, 
+              low_n = low_n_vec,
+              high_n = high_n_vec,
+              chisq = chisq_vec) %>%
+      rowwise() %>%
+      mutate(min_n = min(low_n, high_n)) %>%
+      ungroup()
+}
+
+cutpoints_1 <- sweep_cutpoints1(data_yeschemo, surv_yeschemo_os)
+
+cutpoints_1_n4 <- cutpoints_1 %>%
+   filter(min_n >= 4) %>% #require at least 4 samples in each group
+   filter(chisq == max(chisq)) # cutpoints with the highest chisq result
+
+# they all cut the data with the same samples in each group
+# taking the first row for consistency
+single_cutpoint_best <- cutpoints_1_n4$cutpoint[1]
+
+sweep_cutpoints2 <- function(tidy_data, surv_obj){
+   cutpoints_first = quantile(tidy_data$pred_lp, prob = seq(0, 1, 0.01))[-(1:5)]
+   cutpoints_first = cutpoints_first[-(96:101)]
+   cutpoint_first_vec <- c()
+   cutpoint_second_vec <- c()
+   low_n_vec <- c()
+   middle_n_vec <- c()
+   high_n_vec <- c()
+   chisq_vec <- c()
+   for (i in 1:length(cutpoints_first)){
+      pred_lp_after_cutoff <- tidy_data$pred_lp[tidy_data$pred_lp > min(cutpoints_first)]
+      cutpoints_second <- quantile(pred_lp_after_cutoff, prob = seq(0, 1, 0.01))[-(1:5)]
+      cutpoints_second <- cutpoints_second[-(96:101)]
+      for (j in 1:length(cutpoints_second)){
+         tidy_data_labs <- tidy_data %>%
+            mutate(pred_group = case_when(pred_lp <= cutpoints_first[i] ~ "low", 
+                                          pred_lp > cutpoints_first[i] &
+                                             pred_lp <= cutpoints_second[j] ~ "middle", 
+                                          pred_lp > cutpoints_second[j] ~ "high"))
+         survdiff_results <- survdiff(surv_obj ~ pred_group, data = tidy_data_labs)
+         chisq_vec <- c(chisq_vec, survdiff_results$chisq)
+         cutpoint_first_vec <- c(cutpoint_first_vec, cutpoints_first[[i]])
+         cutpoint_second_vec <- c(cutpoint_second_vec, cutpoints_second[[j]])
+         low_n_vec <- c(low_n_vec, nrow(tidy_data_labs %>% filter(pred_group == "low")))
+         middle_n_vec <- c(middle_n_vec, nrow(tidy_data_labs %>% filter(pred_group == "middle")))
+         high_n_vec <- c(high_n_vec, nrow(tidy_data_labs %>% filter(pred_group == "high")))
+      }
+   }
+   data.frame(cutpoint1 = cutpoint_first_vec,
+              cutpoint2 = cutpoint_second_vec,
+              low_n = low_n_vec,
+              middle_n = middle_n_vec,
+              high_n = high_n_vec,
+              chisq = chisq_vec) %>%
+      rowwise() %>%
+      mutate(min_n = min(low_n, middle_n, high_n)) %>%
+      ungroup()
+}
+
+
+cutpoints_2 <- sweep_cutpoints2(data_yeschemo, surv_yeschemo_os)
+saveRDS(cutpoints_2, here("Results", "Cisplatin", "Plots", "External_Clinical_Testing",
+                          paste0("opt_2cutpoints_", gse4testing, "trained_",
+                                 gse4training, "tested.rds")))
+
+# cutpoints_2 <- readRDS(here("Results", "Cisplatin", "Plots", "External_Clinical_Testing",
+#                             paste0("opt_2cutpoints_", gse4testing, "trained_",
+#                                    gse4training, "_tested.rds")))
+
+cutpoints_2_n4 <- cutpoints_2 %>%
+   filter(min_n >= 4) %>% #require at least 4 samples in each group
+   filter(chisq == max(chisq)) # cutpoints with the highest chisq result
+
+
+# they all cut the data with the same samples in each group
+# taking the first row for consistency
+double_cutpoint_best <- c(cut1 = cutpoints_2_n4$cutpoint1[1], 
+                          cut2 = cutpoints_2_n4$cutpoint2[1])
+
+
+```
+
+
+### Classify predictions
+
+```{r class_predictions}
+
+# classify predictions
+data_yeschemo <- data_yeschemo %>%
+      mutate(pred_2grp_med = factor(case_when(pred_lp < median(pred_lp) ~ "1_Low",
+                                              pred_lp >= median(pred_lp) ~ "2_High"), 
+                             ordered = TRUE),
+          pred_2grp_optimal = case_when(pred_lp < single_cutpoint_best ~ "1_Low",
+                                        pred_lp >= single_cutpoint_best ~ "2_High"),
+          pred_3grp_tert = factor(case_when(pred_lp < quantile(pred_lp, 0.33) ~ "1_Low",
+                                pred_lp >= quantile(pred_lp, 0.33) &
+                                   pred_lp < quantile(pred_lp, 0.66) ~ "2_Middle",
+                                pred_lp >= quantile(pred_lp, 0.66) ~ "3_High"),
+                                ordered = TRUE),
+          pred_3grp_optimal = case_when(pred_lp <= double_cutpoint_best["cut1"] ~ "1_Low",
+                                pred_lp > double_cutpoint_best["cut1"] &
+                                   pred_lp <= double_cutpoint_best["cut2"] ~ "2_Middle",
+                                pred_lp > double_cutpoint_best["cut2"] ~ "3_High"),
+          pred_3grp_2550 = factor(case_when(pred_lp < quantile(pred_lp, 0.25) ~ "1_Low",
+                                pred_lp >= quantile(pred_lp, 0.25) &
+                                   pred_lp < quantile(pred_lp, 0.75) ~ "2_Middle",
+                                pred_lp >= quantile(pred_lp, 0.75) ~ "3_High"), 
+                                ordered = TRUE),
+          pred_quar = factor(case_when(pred_lp < quantile(pred_lp, 0.25) ~ "1_Low",
+                                pred_lp >= quantile(pred_lp, 0.25) &
+                                   pred_lp < quantile(pred_lp, 0.50) ~ "2_Middle Low",
+                                pred_lp >= quantile(pred_lp, 0.50) &
+                                   pred_lp < quantile(pred_lp, 0.75) ~ "3_Middle High",
+                                pred_lp >= quantile(pred_lp, 0.75) ~ "4_High"),
+                             ordered = TRUE))
+
+
+```
+
+Plot KM curves based on linear predictor cohorts
+
+```{r km_yeschemo}
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Intercept only
+
+km_yeschemo_int <- survfit(surv_yeschemo_os ~ 1)
+
+gg_yeschemo_int <- ggsurvplot(km_yeschemo_int, data = data_yeschemo,
+   conf.int = TRUE, # Add confidence interval
+   risk.table = TRUE, # Add risk table
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 190),
+   break.time.by = 24, # add tick every 12 months
+   title = "Yes Cisplatin" + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Top/bottom halves
+
+km_yeschemo_css_new <- survfit(surv_yeschemo_os ~ data_yeschemo$pred_2grp_med)
+
+gg_yeschemo_grp2_med <- ggsurvplot(km_yeschemo_css_new, data = data_yeschemo, size = 1,
+   palette = c("indianred3", "dodgerblue3"), # custom colors
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.250, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 190),
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("High Linear Pred.", "Low Linear Pred."),
+   # labels are opposite of "Cissig score, where higher equals better outcomes
+   # title = "CisSig Score Cohorts - Yes Cisplatin",
+   legend.labs = c("Low Risk", "High Risk"),
+   title = "Yes Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Optimal 2 group cutpoints 
+
+km_yeschemo_css_2grp_opt <- survfit(surv_yeschemo_os ~ data_yeschemo$pred_2grp_optimal)
+
+gg_yeschemo_grp2_opt <- ggsurvplot(km_yeschemo_css_2grp_opt, data = data_yeschemo, size = 1,
+   palette = c("indianred3", "dodgerblue3"), # custom colors
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 190),
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("Lowest third Lin Pred.", "Middle third Lin Pred.",
+   # "Top third Lin Pred."), # labels
+   # title = "CisSig Score 2 Cohorts (optimal) - Yes Cisplatin",
+   legend.labs = c("Low Risk", "High Risk"),
+   title = "Yes Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Tertiles by 33%
+
+km_yeschemo_css_tert_by33 <- survfit(surv_yeschemo_os ~ data_yeschemo$pred_3grp_tert)
+
+gg_yeschemo_grp3_tert <- ggsurvplot(km_yeschemo_css_tert_by33, data = data_yeschemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 190),
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("Lowest third Lin Pred.", "Middle third Lin Pred.",
+   # "Top third Lin Pred."), # labels
+   # title = "CisSig Score Tertile Cohorts (by 33%) - Yes Cisplatin",
+   legend.labs = c("Low Risk", "Middle Risk", "High Risk"),
+   title = "Yes Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Tertiles by 25/50/25%
+
+km_yeschemo_css_tert_by25_50_25 <- survfit(surv_yeschemo_os ~ 
+                                              data_yeschemo$pred_3grp_2550)
+
+gg_yeschemo_grp3_2550 <- ggsurvplot(km_yeschemo_css_tert_by25_50_25, data = data_yeschemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 190),
+   break.time.by = 24, # break X axis in time intervals
+   # # legend.labs = c("Bottom 25% Lin Pred.", "Middle 25-75% Lin Pred.",
+   # "Top 25% Lin Pred."), # labels
+   # title = "CisSig Score Tertile Cohorts (by 25/50/25%) - Yes Cisplatin",
+   legend.labs = c("Low Risk", "Middle Risk", "High Risk"),
+   title = "Yes Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Optimal 3 group cutpoints 
+
+km_yeschemo_css_tert_opt <- survfit(surv_yeschemo_os ~ data_yeschemo$pred_3grp_optimal)
+
+gg_yeschemo_grp3_opt <- ggsurvplot(km_yeschemo_css_tert_opt, data = data_yeschemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 190),
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("Lowest third Lin Pred.", "Middle third Lin Pred.",
+   # "Top third Lin Pred."), # labels
+   # title = "CisSig Score Tertile Cohorts (optimal) - Yes Cisplatin",
+   legend.labs = c("Low Risk", "Middle Risk", "High Risk"),
+   title = "Yes Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Quartiles
+
+km_yeschemo_css_quar <- survfit(surv_yeschemo_os ~ data_yeschemo$pred_quar)
+
+gg_yeschemo_grp4_quar <- ggsurvplot(km_yeschemo_css_quar, data = data_yeschemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 190),
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("Quar 1 Lin Pred.", "Quar 2 Lin Pred.",
+   #                 "Quar 3 Lin Pred.", "Quar 4 Lin Pred."), # labels
+   # title = "CisSig Score Quartile Cohorts - Yes Cisplatin",
+   legend.labs = c("Low Risk", "Middle Low Risk", "Middle High Risk", "High Risk"),
+   title = "Yes Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+```
+
+
+## `no_chemo`
+
+Test the model on patients who didn't receive chemotherapy
+
+```{r predict_nochemo}
+
+# create predictions
+data_nochemo$pred_lp <- predict(model_GSE70691, newdata = data_nochemo, type = "lp")
+
+
+# classify predictions
+data_nochemo <- data_nochemo %>%
+      mutate(pred_2grp_med = factor(case_when(pred_lp < median(pred_lp) ~ "1_Low",
+                                              pred_lp >= median(pred_lp) ~ "2_High"), 
+                             ordered = TRUE),
+          pred_3grp_tert = factor(case_when(pred_lp < quantile(pred_lp, 0.33) ~ "1_Low",
+                                pred_lp >= quantile(pred_lp, 0.33) &
+                                   pred_lp < quantile(pred_lp, 0.66) ~ "2_Middle",
+                                pred_lp >= quantile(pred_lp, 0.66) ~ "3_High"),
+                                ordered = TRUE),
+          pred_3grp_2550 = factor(case_when(pred_lp < quantile(pred_lp, 0.25) ~ "1_Low",
+                                pred_lp >= quantile(pred_lp, 0.25) &
+                                   pred_lp < quantile(pred_lp, 0.75) ~ "2_Middle",
+                                pred_lp >= quantile(pred_lp, 0.75) ~ "3_High"), 
+                                ordered = TRUE),
+          pred_quar = factor(case_when(pred_lp < quantile(pred_lp, 0.25) ~ "1_Low",
+                                pred_lp >= quantile(pred_lp, 0.25) &
+                                   pred_lp < quantile(pred_lp, 0.50) ~ "2_Middle Low",
+                                pred_lp >= quantile(pred_lp, 0.50) &
+                                   pred_lp < quantile(pred_lp, 0.75) ~ "3_Middle High",
+                                pred_lp >= quantile(pred_lp, 0.75) ~ "4_High"),
+                             ordered = TRUE))
+
+```
+
+
+Plot KM curves based on lp. 
+
+```{r km_nochemo}
+
+surv_nochemo_os <- Surv(time = data_nochemo$survival_mo, 
+                         event = data_nochemo$os)
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Intercept only
+
+km_nochemo_int <- survfit(surv_nochemo_os ~ 1)
+
+gg_nochemo_int <- ggsurvplot(km_nochemo_int, data = data_nochemo,
+   conf.int = TRUE, # Add confidence interval
+   risk.table = TRUE, # Add risk table
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 190),
+   break.time.by = 24, # add tick every 12 months
+   title = "No Cisplatin" + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Top/bottom halves
+
+km_nochemo_css_new <- survfit(surv_nochemo_os ~ data_nochemo$pred_2grp_med)
+
+gg_nochemo_grp2_med <- ggsurvplot(km_nochemo_css_new, data = data_nochemo, size = 1,
+   palette = c("indianred3", "dodgerblue3"), # custom colors
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.250, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 190),
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("High Linear Pred.", "Low Linear Pred."),
+   # labels are opposite of "Cissig score, where higher equals better outcomes
+   # title = "CisSig Score Cohorts - Yes Cisplatin",
+   legend.labs = c("Low Risk", "High Risk"),
+   title = "No Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Tertiles by 33%
+
+km_nochemo_css_tert_by33 <- survfit(surv_nochemo_os ~ data_nochemo$pred_3grp_tert)
+
+gg_nochemo_grp3_tert <- ggsurvplot(km_nochemo_css_tert_by33, data = data_nochemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 190),
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("Lowest third Lin Pred.", "Middle third Lin Pred.",
+   # "Top third Lin Pred."), # labels
+   # title = "CisSig Score Tertile Cohorts (by 33%) - Yes Cisplatin",
+   legend.labs = c("Low Risk", "Middle Risk", "High Risk"),
+   title = "No Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Tertiles by 25/50/25%
+
+km_nochemo_css_tert_by25_50_25 <- survfit(surv_nochemo_os ~ 
+                                              data_nochemo$pred_3grp_2550)
+
+gg_nochemo_grp3_2550 <- ggsurvplot(km_nochemo_css_tert_by25_50_25, data = data_nochemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 190),
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("Bottom 25% Lin Pred.", "Middle 25-75% Lin Pred.",
+   # "Top 25% Lin Pred."), # labels
+   # title = "CisSig Score Tertile Cohorts (by 25/50/25%) - Yes Cisplatin",
+   legend.labs = c("Low Risk", "Middle Risk", "High Risk"),
+   title = "No Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+## Quartiles
+
+km_nochemo_css_quar <- survfit(surv_nochemo_os ~ data_nochemo$pred_quar)
+
+gg_nochemo_grp4_quar <- ggsurvplot(km_nochemo_css_quar, data = data_nochemo, size = 1,
+   conf.int = FALSE, # Add confidence interval
+   pval = TRUE, # Add p-value
+   risk.table = TRUE, # Add risk table
+   risk.table.height = 0.25, # change if you have >2 groups
+   risk.table.y.text.col = T, # show colors in table listing
+   ncensor.plot = FALSE,
+   ncensor.plot.height = 0.25,
+   xlab = "Time in months", # adjust X axis label
+   xlim = c(0, 190),
+   break.time.by = 24, # break X axis in time intervals
+   # legend.labs = c("Quar 1 Lin Pred.", "Quar 2 Lin Pred.",
+   #                 "Quar 3 Lin Pred.", "Quar 4 Lin Pred."), # labels
+   # title = "CisSig Score Quartile Cohorts - Yes Cisplatin",
+   legend.labs = c("Low Risk", "Middle Low Risk", "Middle High Risk", "High Risk"),
+   title = "No Cisplatin",
+   ggtheme = theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+   )
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ##
+
+
+```
+
+
+## Plot Results together
+
+```{r plot_kms_together}
+
+combo_plot <- gg_yeschemo_grp2_med$plot + gg_yeschemo_grp2_opt$plot + 
+   gg_yeschemo_grp2_med$table + gg_yeschemo_grp2_opt$table + 
+   gg_yeschemo_grp3_tert$plot + gg_yeschemo_grp3_opt$plot + 
+   gg_yeschemo_grp3_tert$table + gg_yeschemo_grp3_opt$table +
+   gg_nochemo_grp2_med$plot + gg_nochemo_grp3_tert$plot + 
+   gg_nochemo_grp2_med$table + gg_nochemo_grp3_tert$table +
+   plot_layout(nrow = 6, ncol = 2, heights = c(5, 2))
+
+combo_plot
+
+ggsave(filename = here("Results", "Cisplatin", "Plots", "External_Clinical_Testing", 
+                       paste0(gse4training, "_as_testset_", 
+                              "for", gse4testing, "_trained_model.png")), 
+       plot = combo_plot, height = 12, width = 15)
+
+```
+
+
+
+

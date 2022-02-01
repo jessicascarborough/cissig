@@ -1,0 +1,242 @@
+---
+title: "Download and clean GSE48276"
+author: "Jessica Scarborough"
+date: "1/11/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 10) # for downloading larger files
+
+```
+
+
+```{r packages, include=FALSE}
+library(GEOquery)
+library(limma)
+library("maptools")  # point labels without overlaps
+library(umap)
+library(here)
+library(tidyverse)
+
+
+```
+
+## Download Data
+
+### GEO data 
+
+```{r download_GSE, message=FALSE, warning=FALSE}
+# load series and platform data from GEO
+options(readr.show_col_types = FALSE)
+GSE_num <- "GSE48276"
+
+gset <- getGEO(GSE_num, GSEMatrix =TRUE, getGPL=TRUE, AnnotGPL = TRUE)
+if (length(gset) > 1) idx <- grep("GPL14951", attr(gset, "names")) else idx <- 1
+gset <- gset[[idx]]
+
+phenotypes <- gset@phenoData@data
+gene_table <- gset@featureData@data
+gene_ids <- select(gene_table, ID, Symbol)
+
+
+```
+
+
+### Signature data 
+
+Set variables to what is used in the manuscript signature, import that signature. 
+
+
+```{r download_sig}
+
+
+drug <- "Cisplatin"
+de_comp_perc <- .20
+rm_extreme_perc <- 0
+sam_perm <- 10000
+mult_perm <- 1000
+n_folds <- 5
+
+signature <- readRDS(file = here("Results", drug,
+                                 paste0("intersect_sig_",
+                                        "deCompPerc", (de_comp_perc*100),
+                                        "_rmExtremePerc", rm_extreme_perc*100,
+                                        "_samPerm", sam_perm,
+                                        "_multPerm", mult_perm,
+                                        "_nFolds", n_folds, ".rds")))
+
+```
+
+## Clean expression data 
+
+### Log2 Transform if Necessary
+
+Not required here
+
+
+```{r log2_transform}
+
+ex <- exprs(gset)
+# log2 transform
+qx <- as.numeric(quantile(ex, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm=T))
+LogC <- (qx[5] > 100) ||
+  (qx[6]-qx[1] > 50 && qx[2] > 0)
+
+if (LogC) { ex[which(ex <= 0)] <- NaN
+ex <- log2(ex) }
+
+
+```
+
+
+
+### Plots
+
+These plots ensure that the data are normalzed and the distribution is as expected. They are taken directly from the GEO2R code. 
+
+```{r plot_expr}
+
+# box-and-whisker plot
+dev.new(width=3+ncol(gset)/6, height=5)
+par(mar=c(7,4,2,1))
+title <- paste (GSE_num, "/", annotation(gset), sep ="")
+boxplot(ex, boxwex=0.7, notch=T, main=title, outline=FALSE, las=2)
+dev.off()
+
+# expression value distribution plot
+par(mar=c(4,4,2,1))
+title <- paste (GSE_num, "/", annotation(gset), " value distribution", sep ="")
+plotDensities(ex, main=title, legend=F)
+
+# mean-variance trend
+ex <- na.omit(ex) # eliminate rows with NAs
+plotSA(lmFit(ex), main=paste("Mean variance trend,", GSE_num))
+
+# UMAP plot (multi-dimensional scaling)
+ex <- ex[!duplicated(ex), ]  # remove duplicates
+ump <- umap(t(ex), n_neighbors = 15, random_state = 123)
+
+plot(ump$layout, main="UMAP plot, nbrs=15", xlab="", ylab="", pch=20, cex=1.5); pointLabel(ump$layout, labels = rownames(ump$layout), method="SANN", cex=0.6)
+
+```
+
+### Convert gene names
+
+```{r convert_names}
+
+ex_symbols <- data.frame(ex) %>%
+  rownames_to_column("ID") %>%
+  inner_join(gene_ids) %>%
+  select(-ID)
+
+```
+
+### Extract signature expression
+
+Below we check to see if all our signature genes are in this dataset. Here, it appears that all of our signature genes are in the database already, meaning we won't need to adjust the gene names. 
+
+```{r check_genes}
+
+signature %in% ex_symbols$Symbol
+
+```
+
+Let's extract expression of only our signature genes. 
+
+```{r extract_sig_expr}
+
+ex_sig <- ex_symbols %>%
+  filter(Symbol %in% signature) %>%
+  select(Symbol, everything())
+
+```
+
+
+### Clean signature expression
+
+Now we can see that there are duplicate entries for some genes. For these genes, we'll take the median of each entry. 
+
+
+```{r median_expr_dups}
+
+ex_sig_no_dups <- ex_sig %>%
+  group_by(Symbol) %>%
+  summarise(across(everything(), mean))
+
+```
+
+The last thing we'll do to clean this dataset is transpose the data so that genes are columns and samples are rows (the tidy format). 
+
+
+```{r transpose_data}
+
+ex_sig_tidy <- ex_sig_no_dups %>%
+  pivot_longer(cols = -Symbol, names_to = "Sample_ID") %>%
+  pivot_wider(names_from = Symbol, values_from = value)
+
+```
+
+
+## Phenotype data
+
+### Clean phenotype data
+
+```{r phenotype_clean}
+
+phenotypes_tidy <- phenotypes %>%
+  rename(received_nac = `nac:ch1`,
+         survival_mo = `survival (mo):ch1`, 
+         censor_os = `os censor:ch1`,
+         censor_dss = `dss censor:ch1`,
+         c_stage = `cstage:ch1`,
+         p_stage = `pstage:ch1`,
+         histology_tur = `histology tur:ch1`,
+         histology_cyst = `cystectomy histology:ch1`) %>%
+  mutate(survival_mo = as.numeric(survival_mo),
+         os = case_when(censor_os == "censored" ~ 0, # if the patient is censored
+                        censor_os == "uncensored" ~ 1), # by the end of the trial 
+         os_dss = case_when(censor_dss == "censored" ~ 0, # then the event didn't happen
+                            censor_dss == "uncensored" ~ 1)) %>% # a.k.a. they survived
+  select(title, Sample_ID = geo_accession, received_nac, survival_mo, censor_os, 
+         censor_dss, os, os_dss, p_stage, c_stage, histology_tur, histology_cyst)
+
+```
+
+
+## Combine data
+
+Let's combine our phenotypes and gene espression into a single tidied dataset.
+
+```{r combine_data}
+
+data_tidy <- ex_sig_tidy %>%
+  inner_join(phenotypes_tidy)
+
+```
+
+
+## Save Data
+
+```{r save_data}
+
+dir.create(here("Data", "GSE", GSE_num))
+
+write.csv(ex_symbols, file = here("Data", "GSE", GSE_num, "gene_expr_all_raw.csv"),
+          row.names = FALSE)
+
+write.csv(ex_sig_tidy, file = here("Data", "GSE", GSE_num, "gene_expr_sig_tidy.csv"),
+          row.names = FALSE)
+
+write.csv(phenotypes, file = here("Data", "GSE", GSE_num, "phenotypes_raw.csv"),
+          row.names = FALSE)
+
+write.csv(phenotypes_tidy, file = here("Data", "GSE", GSE_num, "phenotypes_tidy.csv"),
+          row.names = FALSE)
+
+write.csv(data_tidy, file = here("Data", "GSE", GSE_num, "data_tidy.csv"),
+          row.names = FALSE)
+
+```
