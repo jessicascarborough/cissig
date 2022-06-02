@@ -221,11 +221,32 @@ tcga_data <- tcga_data %>%
 
 ```
 
+
+# Filter TCGA for only primary samples
+
+```{r tcga_primary}
+
+tcga_primary_parse <- data.frame(do.call("rbind",  # extract portion of barcode referring to sample origin (primary, metastatic, etc)
+                                         strsplit(as.character(tcga_data$sample_ID), "[.]", fixed = FALSE)))
+
+unique(tcga_primary_parse$X4) 
+
+sample_primary <- data.frame(sample_ID = tcga_data$sample_ID, # create df with sample IDs only from primary samples
+                             type = tcga_primary_parse$X4) %>%
+  filter(type %in% c("01A", "01B", "01C", "01R"))
+
+
+tcga_data_primary <- tcga_data %>% # create new tcga dataset with only primary samples
+  filter(sample_ID %in% sample_primary$sample_ID)
+
+```
+
+
 # Save data
 
 ```{r save_data}
 
-save(gdsc_expr, gdsc_dr, gdsc_meta_epi, tcga_data, gdsc_dna, tidy_gdsc,
+save(gdsc_expr, gdsc_dr, gdsc_meta_epi, tcga_data, gdsc_dna, tidy_gdsc, tcga_data_primary, 
      file = here("Data", drug, "cleaned_gdsc_tcga.RData"))
 
 load(here("Data", drug, "cleaned_gdsc_tcga.RData"))

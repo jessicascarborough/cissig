@@ -202,7 +202,8 @@ dir.create(here(&quot;Results&quot;, drug, &quot;Prediction_Modeling&quot;), sho
 dir.create(here(&quot;Results&quot;, drug, &quot;Plots&quot;), showWarnings = FALSE)
 dir.create(here(&quot;Results&quot;, drug, &quot;Plots&quot;, &quot;Linear_Models&quot;), showWarnings = FALSE)
 dir.create(here(&quot;Results&quot;, drug, &quot;Plots&quot;, &quot;ROC_Curves&quot;), showWarnings = FALSE)
-dir.create(here(&quot;Results&quot;, drug, &quot;Plots&quot;, &quot;Null_Model_Metrics&quot;), showWarnings = FALSE)</code></pre>
+dir.create(here(&quot;Results&quot;, drug, &quot;Plots&quot;, &quot;Null_Model_Metrics&quot;), showWarnings = FALSE)
+dir.create(here(&quot;Results&quot;, drug, &quot;Plots&quot;, &quot;External_Clinical_Testing&quot;), showWarnings = FALSE)</code></pre>
 <p>Here, we’ll clean the data downloaded with the <code>download_data.Rmd</code> file.</p>
 <div id="tcga" class="section level1">
 <h1>TCGA</h1>
@@ -397,9 +398,24 @@ tidy_gdsc &lt;- tidy_gdsc %&gt;%
 tcga_data &lt;- tcga_data %&gt;%
   select(sample_ID, tcga_label, all_of(overlap_genes))</code></pre>
 </div>
+<div id="filter-tcga-for-only-primary-samples" class="section level1">
+<h1>Filter TCGA for only primary samples</h1>
+<pre class="r"><code>tcga_primary_parse &lt;- data.frame(do.call(&quot;rbind&quot;,  # extract portion of barcode referring to sample origin (primary, metastatic, etc)
+                                         strsplit(as.character(tcga_data$sample_ID), &quot;[.]&quot;, fixed = FALSE)))
+
+unique(tcga_primary_parse$X4) </code></pre>
+<pre><code>##  [1] &quot;01A&quot; &quot;11A&quot; &quot;01B&quot; &quot;11B&quot; &quot;06A&quot; &quot;01C&quot; &quot;05A&quot; &quot;02B&quot; &quot;02A&quot; &quot;01R&quot; &quot;11C&quot;</code></pre>
+<pre class="r"><code>sample_primary &lt;- data.frame(sample_ID = tcga_data$sample_ID, # create df with sample IDs only from primary samples
+                             type = tcga_primary_parse$X4) %&gt;%
+  filter(type %in% c(&quot;01A&quot;, &quot;01B&quot;, &quot;01C&quot;, &quot;01R&quot;))
+
+
+tcga_data_primary &lt;- tcga_data %&gt;% # create new tcga dataset with only primary samples
+  filter(sample_ID %in% sample_primary$sample_ID)</code></pre>
+</div>
 <div id="save-data" class="section level1">
 <h1>Save data</h1>
-<pre class="r"><code>save(gdsc_expr, gdsc_dr, gdsc_meta_epi, tcga_data, gdsc_dna, tidy_gdsc,
+<pre class="r"><code>save(gdsc_expr, gdsc_dr, gdsc_meta_epi, tcga_data, gdsc_dna, tidy_gdsc, tcga_data_primary, 
      file = here(&quot;Data&quot;, drug, &quot;cleaned_gdsc_tcga.RData&quot;))
 
 load(here(&quot;Data&quot;, drug, &quot;cleaned_gdsc_tcga.RData&quot;))</code></pre>
