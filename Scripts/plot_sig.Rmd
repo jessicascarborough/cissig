@@ -201,9 +201,6 @@ waterfall_bm_plot <- waterfall_bm_results[['plot']]
 
 waterfall_bm_plot
 
-View(waterfall_bm_results$df)
-
-
 ```
 ## Find prevalence of mutations
 
@@ -253,13 +250,13 @@ chi_results_df <- data.frame(gene_name = genes_vec,
                              p_corrected = p_corr_vec) %>%
   mutate(p_corrected = ifelse(p_corrected > 1, 1, p_corrected))
 
-
+print(chi_results_df)
 ```
 
 
 
 ## Plot heatmap
-```{r plot_heatmap}
+```{r plot_mutation_heatmap}
 
 # create df for pheatmap input
 heatmap_df <- ranked_bm_df %>%
@@ -332,7 +329,7 @@ gdsc_signature$tcga_label <- factor(gdsc_signature$tcga_label,
 
 ```{r format_tcga}
 
-tcga_signature <- tcga_data %>%
+tcga_signature <- tcga_data_primary %>%
   select(sample_ID, tcga_label, all_of(signature)) %>%
   mutate_at(signature, scale) %>%
   rowwise() %>% # allow for operations across rows
@@ -841,7 +838,7 @@ heatmap_input <- format_heatmap(tidy_signature_IC50filter, z_cutoff= 2.5)
 ```
 
 
-```{r plot_heatmap}
+```{r plot_expr_heatmap}
   
 setHook("grid.newpage",
       function() pushViewport(
@@ -1021,10 +1018,10 @@ ggsave(here("Results", drug, "Plots",
 # SigQC
 
 
-SigQC is a useful package created by Dr. Andrew Dhawan. It was inspired by a need to compare signatures between datasets. Here we compare the differentially expressed genes from each of the 5 runs and the signature genes within the TCGA epithelial-based expression. Metrics regarding skew, intra-signature correlation, variation carried in the first principal componant, and more are measured. Because the datasets are large, the PCA analysis requires a long time to run. All of the results are stored in the following file path `Plots/Epithelial_Complete/SigQC`. If you wish to run the analysis, simply uncomment the last line. Additionally, a summary plot is added below.  Finally, if you wish to run the analysis in a different dataset (such as the GDSC expression data), you may uncomment the third line of code in this chunk.
+SigQC is a useful package created by Dr. Andrew Dhawan. It was inspired by a need to compare signatures between datasets. Here we compare the differentially expressed genes from each of the 5 runs and the signature genes within the TCGA epithelial-based expression. Metrics regarding skew, intra-signature correlation, variation carried in the first principal component, and more are measured. Because the datasets are large, the PCA analysis requires a long time to run. All of the results are stored in the following file path `Results/Cisplatin/SigQC`. If you wish to run the analysis, simply uncomment the last line. Additionally, a summary plot is added below.  Finally, if you wish to run the analysis in a different dataset (such as the GDSC expression data), you may uncomment the third line of code in this chunk.
 
 
-```{r run_sigQC, include=FALSE}
+```{r run_sigQC, include=TRUE}
 
 dir.create(here("Results", drug, "SigQC"), showWarnings = FALSE)
 
@@ -1051,8 +1048,8 @@ gene_sigs_list[["DE_Results_5"]] <- seeds_list[[5]]
 
 
 showResults <- FALSE # we do not want to show the results in R graphics windows
-doNegativeControl <- TRUE
-boot_n <- 50
+# doNegativeControl <- TRUE
+# boot_n <- 50
 
 make_all_plots(gene_sigs_list, mRNA_expr_matrix, showResults = showResults,
                doNegativeControl = FALSE,
@@ -1060,7 +1057,8 @@ make_all_plots(gene_sigs_list, mRNA_expr_matrix, showResults = showResults,
 
 ```
 
-<!-- ![SigQC Radar Plot](../Results/Cisplatin/SigQC/sig_radarplot.png) -->
+![SigQC Radar Plot](../Results/Cisplatin/SigQC/sig_radarplot.pdf)
+
 
 
 
