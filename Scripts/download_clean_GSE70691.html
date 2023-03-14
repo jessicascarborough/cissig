@@ -268,7 +268,7 @@ plot(ump$layout, main=&quot;UMAP plot, nbrs=15&quot;, xlab=&quot;&quot;, ylab=&q
 </div>
 <div id="clean-signature-expression" class="section level3">
 <h3>Clean signature expression</h3>
-<p>Now we can see that there are duplicate entries for some genes. For these genes, we’ll take the median of each entry.</p>
+<p>Now we can see that there are duplicate entries for some genes. For these genes, we’ll take the mean of each entry.</p>
 <pre class="r"><code>ex_sig_no_dups &lt;- ex_sig %&gt;%
   group_by(Symbol) %&gt;%
   summarise(across(everything(), mean))</code></pre>
@@ -299,9 +299,10 @@ plot(ump$layout, main=&quot;UMAP plot, nbrs=15&quot;, xlab=&quot;&quot;, ylab=&q
 </div>
 <div id="save-data" class="section level2">
 <h2>Save Data</h2>
-<pre class="r"><code>dir.create(here(&quot;Data&quot;, &quot;GSE&quot;, GSE_num))
-
-write.csv(ex_symbols, file = here(&quot;Data&quot;, &quot;GSE&quot;, GSE_num, &quot;gene_expr_all_raw.csv&quot;),
+<pre class="r"><code>dir.create(here(&quot;Data&quot;, &quot;GSE&quot;, GSE_num))</code></pre>
+<pre><code>## Warning in dir.create(here(&quot;Data&quot;, &quot;GSE&quot;, GSE_num)): &#39;/Users/jessicascarborough/
+## repos/cissig/Data/GSE/GSE70691&#39; already exists</code></pre>
+<pre class="r"><code>write.csv(ex_symbols, file = here(&quot;Data&quot;, &quot;GSE&quot;, GSE_num, &quot;gene_expr_all_raw.csv&quot;),
           row.names = FALSE)
 
 write.csv(ex_sig_tidy, file = here(&quot;Data&quot;, &quot;GSE&quot;, GSE_num, &quot;gene_expr_sig_tidy.csv&quot;),

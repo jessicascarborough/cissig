@@ -246,7 +246,7 @@ ex_long_group &lt;- ex_long %&gt;%
    group_by(gene) %&gt;%
    dplyr::summarize(variance = var(expression)) %&gt;%
    arrange(variance) %&gt;%
-   mutate(var_high = if_else(variance &gt; 0.1, 1, 0)) 
+   mutate(var_high = if_else(variance &gt; 0.2, 1, 0)) 
 
 # merge variance labels with original long dataset
 ex_long_var &lt;- ex_long_group %&gt;%
