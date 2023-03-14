@@ -158,7 +158,7 @@ ex_sig <- ex_symbols %>%
 
 ### Clean signature expression
 
-Now we can see that there are duplicate entries for some genes. For these genes, we'll take the median of each entry. 
+Now we can see that there are duplicate entries for some genes. For these genes, we'll take the mean of each entry. 
 
 
 ```{r median_expr_dups}
