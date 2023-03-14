@@ -95,6 +95,7 @@ format_model_data <- function(tidy_data, signature_genes, score_perc, IC50_perc,
   return(complete_data)
 }
 
+
 tidy_signature_scorefilter <- format_model_data(tidy_data = tidy_gdsc, 
                           signature_genes = signature,
                           score_perc = 0.2,
@@ -124,9 +125,9 @@ First, we'll need to organize the mutation data so each gene is a column and eac
 # determine if genes of interest are present in dataset
 genes_interest <- c("BRCA1", "BRCA2", "PALB2", "TP53", "CHEK1", "CHEK2", "ATM", 
                     "BARD1", "BRIP1", "PTEN", "RAD51C", "RAD51D", "NTHL1",
-                    "ATM", "FAM175A", "MRE11A", "NBN")
+                    "FAM175A", "MRE11A", "NBN")
 
-genes_interest[!(genes_interest %in% gdsc_dna$Gene)] # all present
+genes_interest[!(genes_interest %in% unique(gdsc_dna$Gene))] # all present
 
 gdsc_dna_mut_count <- gdsc_dna %>%
   mutate(mutation_present = 1) %>%
@@ -147,8 +148,12 @@ gdsc_dna_mut_binary <- gdsc_dna %>%
               values_fill = 0)
 
 tidy_mutation_sig <- gdsc_dna_mut_binary %>%
-  inner_join(tidy_signature %>% select(cosmic_id, sig_score)) %>%
-  select(cosmic_id, sig_score, everything())
+  right_join(tidy_signature %>% select(cosmic_id, sig_score)) %>%
+  select(cosmic_id, sig_score, everything()) %>% 
+  mutate(across(everything(), ~replace_na(.x, 0)))
+
+# tidy_mutation_sig$BARD1
+
 
 ```
 
@@ -239,6 +244,7 @@ p_corr_vec <- c()
 for(ddr_gene in genes_interest){
   tempTable <- table(mutation_chi_df$score_high, mutation_chi_df %>% pull(ddr_gene))
   print(ddr_gene)
+  print(tempTable)
   chi_results <- chisq.test(tempTable)
   genes_vec <- c(genes_vec, ddr_gene)
   p_value_vec <- c(p_value_vec, chi_results$p.value)
@@ -269,6 +275,9 @@ heatmap_df <- ranked_bm_df %>%
   arrange(desc(bm_row_perc)) %>%
   column_to_rownames("gene_perc") %>%
   select(-c(variable, bm_row_perc))
+
+# Add asterisk for plotting purposes as the only statistically significant result
+rownames(heatmap_df)[rownames(heatmap_df) == "PTEN (10.26%)"] <- "PTEN (10.26%)*"
 
 # create score annotation for heatmap (row names must match column names in heatmap_df)
 annotation_col = ranked_bm_df %>%
@@ -333,7 +342,7 @@ tcga_signature <- tcga_data_primary %>%
   select(sample_ID, tcga_label, all_of(signature)) %>%
   mutate_at(signature, scale) %>%
   rowwise() %>% # allow for operations across rows
-  mutate(sig_score = median(c_across(3:(length(signature)+2)))) # manually check to make sure this works
+  mutate(sig_score = median(c_across(3:(length(signature)+2))))
 
 median_group_tcga <- tcga_signature %>%
   group_by(tcga_label) %>%
@@ -402,13 +411,11 @@ tcc_signature$tcga_label <- factor(tcc_signature$tcga_label,
 
 min_sig_score <- abs(min(gdsc_signature$sig_score))
 
-
 viol_data <- gdsc_signature %>%
   mutate(sig_score = sig_score + (min_sig_score+1)) %>%
   mutate(test = (min_sig_score+1)) %>%
   filter(!is.na(tcga_label))%>%
   filter(!tcga_label %in% c("", "ACC", "UNABLE TO CLASSIFY")) # remove ACC because there's only 1 value
-
 
 median_group_gdsc <- median_group_gdsc %>% 
   filter(!is.na(tcga_label)) %>%
@@ -567,7 +574,7 @@ colnames(tcc_labels_ranked) <- c("tcga_label", "tcc_rank")
 combined_labels_ranked <- merge(gdsc_labels_ranked, tcga_labels_ranked, by = "tcga_label")
 combined_labels_ranked <- merge(combined_labels_ranked, 
                                 tcc_labels_ranked, 
-                                by = "tcga_label", all.x = TRUE)
+                                by = "tcga_label", all.x = TRUE, all.y = TRUE)
 
 
 cor.test(combined_labels_ranked$gdsc_rank, combined_labels_ranked$tcga_rank)
@@ -578,6 +585,7 @@ cor.test(combined_labels_ranked$tcga_rank, combined_labels_ranked$tcc_rank)
 
 
 ```
+
 
 # Cell line persistence plots in GDSC
 
@@ -1045,7 +1053,6 @@ gene_sigs_list[["DE_Results_2"]] <- seeds_list[[2]]
 gene_sigs_list[["DE_Results_3"]] <- seeds_list[[3]]
 gene_sigs_list[["DE_Results_4"]] <- seeds_list[[4]]
 gene_sigs_list[["DE_Results_5"]] <- seeds_list[[5]]
-
 
 showResults <- FALSE # we do not want to show the results in R graphics windows
 # doNegativeControl <- TRUE
