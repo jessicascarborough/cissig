@@ -113,7 +113,7 @@ ex_long_group <- ex_long %>%
    group_by(gene) %>%
    dplyr::summarize(variance = var(expression)) %>%
    arrange(variance) %>%
-   mutate(var_high = if_else(variance > 0.1, 1, 0)) 
+   mutate(var_high = if_else(variance > 0.2, 1, 0)) 
 
 # merge variance labels with original long dataset
 ex_long_var <- ex_long_group %>%
